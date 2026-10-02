@@ -169,7 +169,7 @@ def upsert_offering(
 ) -> CentreTest:
     if db.get(Centre, centre_id, with_for_update=True) is None:
         raise NotFound("Centre not found")
-    if db.get(DiagnosticTest, test_id) is None:
+    if db.get(DiagnosticTest, test_id, with_for_update=True) is None:
         raise NotFound("Test not found")
     offering = db.scalar(
         insert(CentreTest)

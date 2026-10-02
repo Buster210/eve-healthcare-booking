@@ -8,7 +8,7 @@ from sqlalchemy import Insert, Select, delete, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.models import Booking, Centre, CentreTest, User
+from app.models import Booking, Centre, CentreTest, DiagnosticTest, User
 from app.services import catalogue
 
 
@@ -281,13 +281,16 @@ def test_delete_centre_blocks_offering_insert_after_empty_check(
     assert db.scalar(select(Centre.id).where(Centre.id == cid)) is None
 
 
-def test_upsert_offering_blocks_centre_delete_after_validation(
+@pytest.mark.parametrize("parent", [Centre, DiagnosticTest], ids=["centre", "test"])
+def test_upsert_offering_blocks_parent_delete_after_validation(
     db: Session,
     make_offering: Callable[..., CentreTest],
     monkeypatch: pytest.MonkeyPatch,
+    parent: type[Centre] | type[DiagnosticTest],
 ) -> None:
     offering = make_offering()
     cid, tid = offering.centre_id, offering.test_id
+    parent_id = cid if parent is Centre else tid
     db.delete(offering)
     db.commit()
 
@@ -298,7 +301,7 @@ def test_upsert_offering_blocks_centre_delete_after_validation(
             with Session(db.get_bind()) as deleting:
                 deleting.execute(text("SET LOCAL lock_timeout = '200ms'"))
                 with pytest.raises(OperationalError) as error:
-                    deleting.execute(delete(Centre).where(Centre.id == cid))
+                    deleting.execute(delete(parent).where(parent.id == parent_id))
                 assert error.value.orig.sqlstate == "55P03"
             return scalar(statement)
 
