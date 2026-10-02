@@ -46,6 +46,7 @@ uv run uvicorn app.main:app --reload
 | `DATABASE_URL` | PostgreSQL connection URL using `postgresql+psycopg`; required. |
 | `JWT_SECRET` | HS256 signing key, at least 32 characters; required. |
 | `WEBHOOK_SECRET` | HMAC signing key, at least 32 characters; required. |
+| `WEBHOOK_MAX_BODY_BYTES` | Maximum webhook request size; defaults to 65536 bytes (64 KiB). Larger bodies return 413. |
 | `REDIS_URL` | Optional Redis URL for catalogue caching and shared rate limits. Compose sets this automatically; the local worker and beat need a reachable Redis broker. |
 | `JWT_EXPIRE_MINUTES` | Access-token lifetime; defaults to 60 minutes. |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`; defaults to `INFO`. |

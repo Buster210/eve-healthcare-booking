@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     jwt_secret: SecretStr = Field(min_length=32)
     jwt_expire_minutes: int = Field(default=60, gt=0)
     webhook_secret: SecretStr = Field(min_length=32)
+    webhook_max_body_bytes: int = Field(default=64 * 1024, gt=0)
     redis_url: str | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 

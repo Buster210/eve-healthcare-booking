@@ -1,7 +1,8 @@
+import asyncio
 import hashlib
 import hmac
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
@@ -10,7 +11,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from httpx import Response
+from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, object_session
 
@@ -18,6 +19,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.enums import BookingStatus, PaymentStatus
 from app.models import Booking, CentreTest, Payment, User, WebhookEvent
+from app.schemas.payments import WebhookPayload
 from app.state import transition
 
 
@@ -69,6 +71,99 @@ def event(
         "provider_ref": payment.provider_ref,
         "status": status,
     }
+
+
+def test_webhook_openapi_contract(client: TestClient) -> None:
+    response = client.get("/openapi.json")
+    assert response.status_code == 200, response.text
+    document = response.json()
+    operation = document["paths"]["/payments/webhook/"]["post"]
+    body = operation["requestBody"]
+    assert body["required"] is True
+    assert body["content"]["application/json"]["schema"] == (
+        WebhookPayload.model_json_schema()
+    )
+    signature = next(
+        parameter
+        for parameter in operation["parameters"]
+        if parameter["name"] == "X-Signature"
+    )
+    assert signature["in"] == "header"
+    assert signature["schema"]["type"] == "string"
+    responses = operation["responses"]
+    assert set(responses) == {"200", "202", "401", "404", "413", "422"}
+    assert responses["202"]["content"] == responses["200"]["content"]
+    error_schema = {"$ref": "#/components/schemas/ErrorResponse"}
+    for status in ("401", "404", "413", "422"):
+        assert responses[status]["content"]["application/json"]["schema"] == (
+            error_schema
+        )
+    schemas = document["components"]["schemas"]
+    error = schemas["ErrorResponse"]["properties"]["error"]
+    detail = schemas[error["$ref"].rsplit("/", 1)[1]]
+    assert detail["required"] == ["code", "message"]
+    assert set(detail["properties"]) == {"code", "message", "details"}
+    for path in document["paths"].values():
+        for route in path.values():
+            if "422" in route.get("responses", {}):
+                assert (
+                    route["responses"]["422"]["content"]["application/json"]["schema"]
+                    == error_schema
+                )
+
+
+@pytest.mark.parametrize("mode", ["content_length", "chunked", "at_limit"])
+def test_webhook_body_size_limit(
+    client: TestClient,
+    db: Session,
+    pending_payment: Payment,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    request = signed_body(event(pending_payment))
+    body = request["content"]
+    limit = len(body) if mode == "at_limit" else len(body) - 1
+    monkeypatch.setattr(
+        "app.routers.payments.get_settings",
+        lambda: get_settings().model_copy(update={"webhook_max_body_bytes": limit}),
+    )
+    if mode != "chunked":
+        request["headers"]["Content-Length"] = str(len(body))
+    consumed = []
+
+    async def chunks() -> AsyncIterator[bytes]:
+        for chunk in (body[:-1], body[-1:], b" "):
+            consumed.append(chunk)
+            yield chunk
+
+    async def send() -> Response:
+        async with AsyncClient(
+            transport=ASGITransport(app=client.app), base_url="http://testserver"
+        ) as stream_client:
+            return await stream_client.post(
+                "/payments/webhook/",
+                headers=request["headers"],
+                content=body if mode == "at_limit" else chunks(),
+            )
+
+    response = asyncio.run(send())
+    if mode == "at_limit":
+        assert response.status_code == 200, response.text
+        assert response.json() == {"result": "processed"}
+        db.refresh(pending_payment)
+        assert pending_payment.status == PaymentStatus.SUCCESS
+    else:
+        assert response.status_code == 413, response.text
+        assert response.json() == {
+            "error": {
+                "code": "PAYLOAD_TOO_LARGE",
+                "message": "Webhook body exceeds size limit",
+            }
+        }
+        assert consumed == ([] if mode == "content_length" else [body[:-1], body[-1:]])
+        db.refresh(pending_payment)
+        assert pending_payment.status == PaymentStatus.PENDING
+        assert db.scalar(select(func.count()).select_from(WebhookEvent)) == 0
 
 
 @pytest.mark.parametrize("signature", [None, "bad", "é"])

@@ -54,6 +54,21 @@ def test_rejects_requests_over_limit(client: TestClient) -> None:
     }
 
 
+@pytest.mark.parametrize(("now", "retry_after"), [(100.0, "10"), (109.2, "1")])
+def test_rate_limit_response_has_retry_after(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    now: float,
+    retry_after: str,
+) -> None:
+    for _ in range(2):
+        assert client.get("/first").status_code == 200
+    monkeypatch.setattr(ratelimit, "monotonic", lambda: now)
+    response = client.get("/first")
+    assert response.status_code == 429, response.text
+    assert response.headers["Retry-After"] == retry_after
+
+
 def test_window_resets_at_expiry(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

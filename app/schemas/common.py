@@ -15,6 +15,16 @@ NonNulString = Annotated[str, AfterValidator(_reject_nul)]
 Int4Id = Annotated[int, Field(gt=0, le=2_147_483_647)]
 
 
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+    details: object | None = None
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorDetail
+
+
 class Page[T](BaseModel):
     items: list[T]
     total: int

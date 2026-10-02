@@ -1,10 +1,13 @@
 import logging
+from math import ceil
 
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
+
+from app.schemas.common import ErrorResponse
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +52,11 @@ class Forbidden(AppError):
         super().__init__(403, "FORBIDDEN", message)
 
 
+class PayloadTooLarge(AppError):
+    def __init__(self, message: str = "Payload too large") -> None:
+        super().__init__(413, "PAYLOAD_TOO_LARGE", message)
+
+
 class InvalidState(AppError):
     def __init__(
         self, message: str = "Operation not allowed in the current state"
@@ -68,10 +76,20 @@ def error_response(
         error["details"] = jsonable_encoder(details)
     if status_code == 401:
         headers = {**(headers or {}), "WWW-Authenticate": "Bearer"}
+    if status_code == 429 and isinstance(details, dict):
+        headers = {
+            **(headers or {}),
+            "Retry-After": str(max(1, ceil(details.get("retry_after", 1)))),
+        }
     return JSONResponse({"error": error}, status_code=status_code, headers=headers)
 
 
 def register_error_handlers(app: FastAPI) -> None:
+    app.router.responses[422] = {
+        "model": ErrorResponse,
+        "description": "Request validation failed",
+    }
+
     @app.exception_handler(AppError)
     def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
         return error_response(exc.status_code, exc.code, exc.message, exc.details)
