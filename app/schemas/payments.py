@@ -4,7 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.enums import BookingStatus, PaymentStatus
-from app.schemas.common import Int4Id
+from app.schemas.common import Int4Id, NonNulString
 
 
 class PaymentCreate(BaseModel):
@@ -22,8 +22,8 @@ class PaymentResponse(BaseModel):
 
 
 class WebhookPayload(BaseModel):
-    event_id: str = Field(min_length=1, max_length=100)
-    provider_ref: str = Field(min_length=1, max_length=100)
+    event_id: NonNulString = Field(min_length=1, max_length=100)
+    provider_ref: NonNulString = Field(min_length=1, max_length=100)
     status: Literal[PaymentStatus.SUCCESS, PaymentStatus.FAILED]
 
 

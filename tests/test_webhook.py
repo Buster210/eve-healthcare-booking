@@ -104,6 +104,8 @@ def test_bad_signature_is_rejected_before_database_work(
         {"event_id": "evt-1", "provider_ref": "sim_unknown", "status": "PENDING"},
         {"event_id": "x" * 101, "provider_ref": "sim_unknown", "status": "SUCCESS"},
         {"event_id": "evt-1", "provider_ref": "x" * 101, "status": "SUCCESS"},
+        {"event_id": "evt\x00-1", "provider_ref": "sim_unknown", "status": "SUCCESS"},
+        {"event_id": "evt-1", "provider_ref": "sim\x00_unknown", "status": "SUCCESS"},
     ],
 )
 def test_signed_invalid_payload_returns_validation_error(
@@ -295,6 +297,33 @@ def test_stale_outcome_is_ignored(
     assert db.get(Booking, pending_payment.booking_id).status == booking_status
     assert db.scalar(select(func.count()).select_from(WebhookEvent)) == 2
     assert any(record.message == "webhook_ignored" for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "booking_status"), [("SUCCESS", "CONFIRMED"), ("FAILED", "FAILED")]
+)
+def test_elapsed_appointment_webhook_settles_pending_payment(
+    client: TestClient,
+    db: Session,
+    pending_payment: Payment,
+    outcome: str,
+    booking_status: str,
+) -> None:
+    booking = db.get(Booking, pending_payment.booking_id)
+    booking.appointment_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.commit()
+    response = client.post(
+        "/payments/webhook/", **signed_body(event(pending_payment, status=outcome))
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {"result": "processed"}
+    db.refresh(pending_payment)
+    db.refresh(booking)
+    assert pending_payment.status == outcome
+    assert booking.status == booking_status
+    stored = db.scalars(select(WebhookEvent)).one()
+    assert stored.status == "PROCESSED"
+    assert stored.payload == event(pending_payment, status=outcome)
 
 
 @pytest.mark.parametrize("failure", ["runtime", "database"])
