@@ -3,11 +3,40 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import Engine, insert, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Booking, CentreTest, Payment, User
+from app.models import Booking, CentreTest, Payment, User, WebhookEvent
+
+
+@pytest.mark.parametrize(
+    ("model", "name", "columns"),
+    [
+        (Payment, "ix_payments_booking_id", ["booking_id"]),
+        (WebhookEvent, "ix_webhook_events_status_id", ["status", "id"]),
+    ],
+)
+def test_migrated_query_indexes_match_metadata(
+    test_engine: Engine,
+    model: type[Payment] | type[WebhookEvent],
+    name: str,
+    columns: list[str],
+) -> None:
+    migrated = next(
+        index
+        for index in inspect(test_engine).get_indexes(model.__tablename__)
+        if index["name"] == name
+    )
+    declared = next(index for index in model.__table__.indexes if index.name == name)
+    assert (
+        migrated["column_names"]
+        == [column.name for column in declared.columns]
+        == columns
+    )
+    assert migrated["unique"] is declared.unique is False
+    assert not migrated.get("dialect_options", {}).get("postgresql_where")
+    assert declared.dialect_options["postgresql"]["where"] is None
 
 
 @pytest.mark.parametrize("amount", [Decimal("0"), Decimal("-1"), Decimal("NaN")])

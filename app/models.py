@@ -155,6 +155,7 @@ class Payment(Base):
         CheckConstraint(
             "amount > 0 AND amount <> 'NaN'", name="ck_payments_amount_positive"
         ),
+        Index("ix_payments_booking_id", "booking_id"),
         Index(
             "uq_payments_active_booking",
             "booking_id",
@@ -186,6 +187,7 @@ class WebhookEvent(Base):
             "status IN ('PROCESSED', 'FAILED')", name="ck_webhook_events_status"
         ),
         Index("ix_webhook_events_provider_ref", "provider_ref"),
+        Index("ix_webhook_events_status_id", "status", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
