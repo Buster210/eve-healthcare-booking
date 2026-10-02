@@ -3,10 +3,12 @@ from datetime import timedelta
 
 from celery import Celery
 from celery.signals import beat_init, worker_init
+from celery.signals import setup_logging as celery_setup_logging
 from sqlalchemy.exc import OperationalError
 
 from app.config import get_settings
 from app.db import SessionLocal
+from app.logging import setup_logging
 from app.services import bookings
 
 logger = logging.getLogger(__name__)
@@ -38,6 +40,13 @@ def _require_redis_url(sender=None, **kwargs) -> None:
 
 worker_init.connect(_require_redis_url)
 beat_init.connect(_require_redis_url)
+
+
+def _setup_celery_logging(sender=None, **kwargs) -> None:
+    setup_logging(get_settings().log_level)
+
+
+celery_setup_logging.connect(_setup_celery_logging)
 
 
 @app.task(autoretry_for=(OperationalError,), retry_backoff=True, max_retries=5)

@@ -1,3 +1,4 @@
+import logging
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -6,6 +7,7 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from app import worker
+from app.logging import JsonFormatter
 from app.services import bookings, payments
 
 
@@ -146,3 +148,21 @@ def test_missing_redis_url_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: SimpleNamespace(redis_url="redis://localhost:6379/0"),
     )
     worker._require_redis_url(sender=None)
+
+
+def test_celery_setup_logging_uses_json_formatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker, "get_settings", lambda: SimpleNamespace(log_level="INFO")
+    )
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        worker.celery_setup_logging.send(sender=worker.app)
+        assert any(
+            isinstance(handler.formatter, JsonFormatter) for handler in root.handlers
+        )
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
