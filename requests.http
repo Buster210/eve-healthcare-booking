@@ -145,3 +145,37 @@ X-Signature: invalid
 ### Booking after webhook: CONFIRMED
 GET {{baseUrl}}/bookings/{{bookingId}}
 Authorization: Bearer {{token}}
+
+### Payment retry (use a fresh booking; this one fails immediately)
+# @name retryBooking
+POST {{baseUrl}}/bookings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "centre_id": {{centreId}},
+  "test_id": {{testId}},
+  "appointment_at": "2030-01-02T10:00:00+05:30"
+}
+
+### First payment attempt: 201, FAILED
+# @name failedPayment
+POST {{baseUrl}}/payments/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "booking_id": {{retryBooking.response.body.id}},
+  "simulate_outcome": "FAILED"
+}
+
+### Retry failed booking: 201, PENDING
+# @name retriedPayment
+POST {{baseUrl}}/payments/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "booking_id": {{retryBooking.response.body.id}},
+  "simulate_outcome": "PENDING"
+}

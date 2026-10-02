@@ -2,6 +2,8 @@
 
 A FastAPI and PostgreSQL service for diagnostic test bookings and simulated payments. Users browse centres and their tests, book an appointment, and pay through a mock provider. Signed webhooks complete pending payments without processing the same event twice.
 
+Beyond the brief, the service also caches catalogue reads in Redis, shares auth rate limits through Redis, runs a Celery worker for stale bookings and failed webhooks, allows limited payment retries, and validates money and text inputs at the database.
+
 ## Run locally
 
 ### Docker
@@ -13,7 +15,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Compose starts PostgreSQL 17 and the API, applying migrations before serving requests. The API runs at `http://localhost:8000`; Swagger UI is at `/docs`. Both exposed ports, 8000 and 5432, bind to localhost.
+Compose starts PostgreSQL 17, Redis, the API, a Celery worker and Celery beat. The API applies migrations before serving requests. Beat expires stale bookings every five minutes and retries failed webhooks every minute. The API runs at `http://localhost:8000`; Swagger UI is at `/docs`. Both exposed ports, 8000 and 5432, bind to localhost.
 
 Create a development admin and sample catalogue:
 
@@ -35,7 +37,7 @@ uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 ```
 
-`make` provides shortcuts for starting Docker, migrations, seeding, running the API, testing, linting and formatting. For local seeding, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` before running `make seed`.
+`make` provides shortcuts for starting Docker, migrations, seeding, running the API, worker and beat, testing, linting and formatting. When running processes locally, set `REDIS_URL=redis://localhost:6379/0` and start Redis; `make worker` and `make beat` connect to that broker. For local seeding, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` before running `make seed`.
 
 ### Configuration
 
@@ -44,9 +46,11 @@ uv run uvicorn app.main:app --reload
 | `DATABASE_URL` | PostgreSQL connection URL using `postgresql+psycopg`; required. |
 | `JWT_SECRET` | HS256 signing key, at least 32 characters; required. |
 | `WEBHOOK_SECRET` | HMAC signing key, at least 32 characters; required. |
+| `REDIS_URL` | Optional Redis URL for catalogue caching and shared rate limits. Compose sets this automatically; the local worker and beat need a reachable Redis broker. |
 | `JWT_EXPIRE_MINUTES` | Access-token lifetime; defaults to 60 minutes. |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`; defaults to `INFO`. |
 | `TEST_DATABASE_URL` | Separate scratch database for tests; see below. |
+| `TEST_REDIS_URL` | Optional Redis URL for cache integration tests; tests skip those checks when unset. |
 | `RATE_LIMIT_ENABLED` | Auth rate limits default to enabled; `false`, `0` or `no` disables them. |
 
 `ADMIN_EMAIL` and `ADMIN_PASSWORD` apply only to the seed command. Passwords must contain 8–128 characters. Do not commit `.env` or real credentials.
@@ -98,11 +102,13 @@ Use `Authorization: Bearer <token>` for authenticated requests. Catalogue reads 
 
 Creation returns 201, reads and updates return 200, and successful deletes return 204. Duplicate emails, duplicate catalogue entries, active duplicate bookings, resources in use and invalid state changes return 409. Unknown resources return 404. Emails are matched case-insensitively; unknown email and incorrect password both return 401 at login.
 
-Appointment times must include a timezone and be in the future. Offering prices must be positive. The server determines booking and payment amounts, rather than accepting amounts from the caller.
+Appointment times must include a timezone and be in the future. Offering prices must be positive. Database checks reject non-positive and `NaN` prices and amounts for offerings, bookings and payments. The server determines booking and payment amounts, rather than accepting amounts from the caller. NUL characters in user names, catalogue text fields and the centre search query return 422.
 
 Lists accept `limit` (1–100, default 20) and `offset` (default 0), and return `{"items": [...], "total": n, "limit": l, "offset": o}`. Errors return `{"error": {"code": "...", "message": "...", "details": ...}}`; `details` is optional. Request validation failures return 422.
 
-Responses include `X-Request-ID`, which also appears in the JSON request log. Signup and login allow 10 requests per minute per client IP; excess requests return 429 with `details.retry_after`.
+Responses carry `X-Request-ID`. Signup and login allow 10 requests per minute per client IP (429 beyond that).
+
+Centre and test reads use Redis for up to 60 seconds. Catalogue writes bump a shared cache version so older entries are no longer used. If Redis is unset or unavailable, reads go to PostgreSQL. Auth rate limits also use Redis when configured and fall back to per-process memory if Redis is unavailable.
 
 ### Example: booking and payment
 
@@ -141,6 +147,8 @@ curl -s "localhost:8000/bookings/$BOOKING_ID" -H "Authorization: Bearer $TOKEN"
 
 Omit `simulate_outcome` for a random `SUCCESS` or `FAILED`, or supply either value to test an immediate outcome. `PENDING` leaves the payment open for a webhook.
 
+A failed payment marks its booking `FAILED`. A new payment request for that booking moves it back to `PENDING`; at most three payment attempts are allowed per booking. Payments, including retries, return 409 once the appointment time has passed. Failed webhook processing is recorded and returns HTTP 202 with `{"result":"queued"}`. The worker retries those events in the background, recording `attempts` and `last_error`; retries stop after five total attempts. An event whose booking or payment is locked by another transaction is skipped until the next run without using an attempt. The worker and beat exit at startup if `REDIS_URL` is unset.
+
 `requests.http` provides the same flow for REST clients. To exercise concurrent payment requests and duplicate webhook deliveries:
 
 ```bash
@@ -156,14 +164,12 @@ Models live in `app/models.py`; Alembic migrations create the schema.
 | Table | Role and relationships |
 | --- | --- |
 | `users` | Email, password hash, name and admin flag. Email is stored lowercase and unique. |
-| `centres` | Name and location, unique as a pair. |
-| `diagnostic_tests` | Unique test name and optional description. |
-| `centre_tests` | Joins a centre and test, with a positive `Numeric(10,2)` price. Each pair has one offering. |
+| `centres`, `diagnostic_tests`, `centre_tests` | Catalogue: centres with locations, tests, and one `Numeric(10,2)` price per centre/test pair. |
 | `bookings` | User, centre, test, appointment time, amount snapshot and status. A composite foreign key requires a valid offering. |
 | `payments` | Booking, amount, status and unique provider reference. |
-| `webhook_events` | Unique event ID, provider reference, status, JSON payload and receipt time. |
+| `webhook_events` | Unique event ID, provider reference, processing status, attempts, last error, JSON payload and receipt time. |
 
-Money uses decimal columns rather than floating-point values; seed prices use INR. Appointment timestamps include timezone information. Status columns use database `CHECK` constraints alongside Python enums.
+Money uses decimal columns rather than floating-point values; seed prices use INR. Database `CHECK` constraints require positive, non-`NaN` money values. Appointment timestamps include timezone information. Status columns use database `CHECK` constraints alongside Python enums.
 
 Partial unique indexes allow one active booking per user/centre/test/time and one pending or successful payment per booking. Failed or cancelled bookings do not prevent rebooking. Bookings keep their original price even if an offering changes later.
 
@@ -171,11 +177,11 @@ The centre-to-offering foreign key uses `CASCADE`, but the API rejects centre de
 
 ## Payment states and webhook handling
 
-Bookings move from `PENDING` to `CONFIRMED`, `FAILED` or `CANCELLED`. Payments move from `PENDING` to `SUCCESS` or `FAILED`. These outcomes are terminal; a failed booking needs a new booking before another payment attempt. `app/state.py` validates both payment and booking transitions before applying an outcome.
+Bookings move from `PENDING` to `CONFIRMED`, `FAILED` or `CANCELLED`. A failed booking can move back to `PENDING` for another payment attempt, up to three attempts per booking. Payments move from `PENDING` to `SUCCESS` or `FAILED`; each payment outcome is terminal. `app/state.py` validates both payment and booking transitions before applying an outcome.
 
 The webhook requires `X-Signature` containing the hexadecimal HMAC-SHA256 of the **raw request bytes**. Signature verification uses `hmac.compare_digest` before accessing the database; missing or invalid signatures return 401.
 
-Within one transaction, the handler records the unique `event_id`, locks the booking before its payment, and applies the outcome. A duplicate event returns `duplicate`. An unknown provider reference returns 404 and rolls back the event, so a later retry can succeed. The handler returns `no_op` for an already-applied outcome and `ignored` for a conflicting terminal outcome, both with HTTP 200. Successful updates return `processed`.
+Within one transaction, the handler records the unique `event_id`, locks the booking before its payment, and applies the outcome. A duplicate event returns `duplicate`. An unknown provider reference returns 404 and rolls back the event, so a later retry can succeed. The handler returns `no_op` for an already-applied outcome and `ignored` for a conflicting terminal outcome, both with HTTP 200. Successful updates return `processed`. Other processing errors are recorded as `FAILED`; the API returns 202 `queued`, and a scheduled task retries them every minute up to five total attempts. Each event stores its attempt count and most recent error.
 
 Event IDs remain stored for replay detection. No retention job deletes them.
 
@@ -185,11 +191,13 @@ Event IDs remain stored for replay detection. No retention job deletes them.
 - Centres have no availability calendar, opening hours or capacity limits. A future appointment time does not guarantee a physical slot.
 - Payments are simulated. The service does not collect card details, issue refunds or call a real payment gateway.
 - Synchronous SQLAlchemy keeps request handling and transactions straightforward. PostgreSQL supplies the row locks and constraints needed for concurrency.
-- Auth rate limits use process memory, so multiple workers would have separate counters. Payment and webhook routes currently have no rate limit. Apply deployment-level limits before exposing them publicly.
+- Redis shares auth rate-limit counters across API processes when available; the in-memory fallback has per-process counters. Payment and webhook routes have no application rate limit. Apply deployment-level limits before exposing them publicly.
+- Redis cache entries expire after 60 seconds. Catalogue mutations invalidate them by incrementing a shared version; Redis outages bypass the cache and use PostgreSQL.
+- Celery beat schedules stale-booking expiration every five minutes and failed-webhook retries every minute. Webhook retries are capped at five total processing attempts.
 - JWTs expire but have no revocation list. Discarding a token logs out the client; the token remains valid until expiry.
 
 ## With more time
 
 - Model centre availability and capacity before accepting real appointments.
-- Define payment retry, refund and webhook reconciliation policies before integrating a provider. Add a background queue/outbox if processing needs to leave the request path.
-- Share auth rate-limit counters across workers, for example with Redis, and add limits for payment/webhook traffic. Cache the catalogue only if measurements justify it.
+- Integrate a real payment provider, then define refund and reconciliation policies. Current payments are simulated and webhook retries are capped.
+- Add application-level limits for payment and webhook traffic if those routes need them.
