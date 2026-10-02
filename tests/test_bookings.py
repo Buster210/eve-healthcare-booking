@@ -280,3 +280,138 @@ def test_booking_body_ids_must_fit_postgres_int4(
     response = client.post("/bookings", json=payload, headers=auth_headers(make_user()))
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize(
+    ("age", "status", "payment_status", "expected"),
+    [
+        (31, BookingStatus.PENDING, None, BookingStatus.CANCELLED),
+        (29, BookingStatus.PENDING, None, BookingStatus.PENDING),
+        (30, BookingStatus.PENDING, None, BookingStatus.PENDING),
+        (31, BookingStatus.PENDING, PaymentStatus.PENDING, BookingStatus.PENDING),
+        (31, BookingStatus.PENDING, PaymentStatus.SUCCESS, BookingStatus.PENDING),
+        (31, BookingStatus.PENDING, PaymentStatus.FAILED, BookingStatus.CANCELLED),
+        (31, BookingStatus.CONFIRMED, None, BookingStatus.CONFIRMED),
+        (31, BookingStatus.FAILED, None, BookingStatus.FAILED),
+        (31, BookingStatus.CANCELLED, None, BookingStatus.CANCELLED),
+    ],
+)
+def test_expire_stale_bookings(
+    client: TestClient,
+    db: Session,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    make_offering: Callable[..., CentreTest],
+    monkeypatch: pytest.MonkeyPatch,
+    age: int,
+    status: BookingStatus,
+    payment_status: PaymentStatus | None,
+    expected: BookingStatus,
+) -> None:
+    from app.services import bookings
+
+    now = datetime.now(UTC)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(bookings, "datetime", FixedDatetime)
+    headers = auth_headers(make_user())
+    payload = booking_payload(make_offering())
+    booking_id = client.post("/bookings", json=payload, headers=headers).json()["id"]
+    booking = db.get(Booking, booking_id)
+    booking.created_at = now - timedelta(minutes=age)
+    if status != BookingStatus.PENDING:
+        transition(booking, status)
+    if payment_status is not None:
+        db.add(
+            Payment(
+                booking_id=booking.id,
+                amount=booking.amount,
+                provider_ref=f"sim_{uuid4().hex}",
+                status=payment_status,
+            )
+        )
+    db.commit()
+    count = bookings.expire_stale_bookings(db, timedelta(minutes=30))
+    assert count == int(expected == BookingStatus.CANCELLED and status != expected)
+    db.commit()
+    db.refresh(booking)
+    assert booking.status == expected
+    assert bookings.expire_stale_bookings(db, timedelta(minutes=30)) == 0
+    db.commit()
+    if expected == BookingStatus.CANCELLED:
+        assert (
+            client.post("/bookings", json=payload, headers=headers).status_code == 201
+        )
+
+
+def test_expiry_skips_locked_bookings(
+    client: TestClient,
+    db: Session,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    make_offering: Callable[..., CentreTest],
+) -> None:
+    from app.services.bookings import expire_stale_bookings
+
+    created = create_booking(client, auth_headers(make_user()), make_offering())
+    booking = db.get(Booking, created["id"])
+    booking.created_at = datetime.now(UTC) - timedelta(hours=1)
+    db.commit()
+    with Session(db.get_bind()) as other:
+        other.get(Booking, booking.id, with_for_update=True)
+        assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+        db.commit()
+    assert expire_stale_bookings(db, timedelta(minutes=30)) == 1
+    db.rollback()
+    db.refresh(booking)
+    assert booking.status == BookingStatus.PENDING
+
+
+@pytest.mark.parametrize("minutes", [0, -1])
+def test_expiry_rejects_nonpositive_age(db: Session, minutes: int) -> None:
+    from app.services.bookings import expire_stale_bookings
+
+    with pytest.raises(ValueError, match="must be positive"):
+        expire_stale_bookings(db, timedelta(minutes=minutes))
+
+
+def test_expiry_with_no_bookings(db: Session) -> None:
+    from app.services.bookings import expire_stale_bookings
+
+    assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+
+
+def test_expiry_skips_booking_with_locked_payment(
+    client: TestClient,
+    db: Session,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    make_offering: Callable[..., CentreTest],
+) -> None:
+    from sqlalchemy.orm import Session as SASession
+
+    from app.services.bookings import expire_stale_bookings
+
+    created = create_booking(client, auth_headers(make_user()), make_offering())
+    booking = db.get(Booking, created["id"])
+    assert booking is not None
+    booking.created_at = datetime.now(UTC) - timedelta(hours=1)
+    payment = Payment(
+        booking_id=booking.id,
+        amount=booking.amount,
+        provider_ref=f"sim_{uuid4().hex}",
+    )
+    db.add(payment)
+    db.commit()
+    with SASession(db.get_bind()) as other:
+        other.get(Payment, payment.id, with_for_update=True)
+        assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+        db.commit()
+    db.refresh(booking)
+    assert booking.status == BookingStatus.PENDING
+    assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+    db.rollback()

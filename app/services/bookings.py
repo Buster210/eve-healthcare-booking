@@ -1,4 +1,5 @@
 import logging
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +12,43 @@ from app.schemas.bookings import BookingCreate
 from app.state import InvalidTransition, transition
 
 logger = logging.getLogger(__name__)
+
+
+def expire_stale_bookings(db: Session, older_than: timedelta) -> int:
+    if older_than <= timedelta(0):
+        raise ValueError("older_than must be positive")
+    bookings = db.scalars(
+        select(Booking)
+        .where(
+            Booking.status == BookingStatus.PENDING,
+            Booking.created_at < datetime.now(UTC) - older_than,
+        )
+        .order_by(Booking.id)
+        .with_for_update(skip_locked=True)
+    ).all()
+    count = 0
+    for booking in bookings:
+        active_payment = db.scalar(
+            select(Payment.id)
+            .where(
+                Payment.booking_id == booking.id,
+                Payment.status.in_([PaymentStatus.PENDING, PaymentStatus.SUCCESS]),
+            )
+            .with_for_update(skip_locked=True)
+        )
+        if active_payment is None:
+            has_active = db.scalar(
+                select(Payment.id).where(
+                    Payment.booking_id == booking.id,
+                    Payment.status.in_([PaymentStatus.PENDING, PaymentStatus.SUCCESS]),
+                )
+            )
+            if has_active is not None:
+                continue
+            transition(booking, BookingStatus.CANCELLED)
+            count += 1
+    db.flush()
+    return count
 
 
 def create_booking(db: Session, user_id: int, payload: BookingCreate) -> Booking:

@@ -1,4 +1,4 @@
-.PHONY: up down migrate seed run test lint fmt
+.PHONY: up down migrate seed run worker beat test lint fmt
 
 up:
 	docker compose up --build -d
@@ -14,6 +14,12 @@ seed:
 
 run:
 	uv run uvicorn app.main:app --reload
+
+worker:
+	uv run celery -A app.worker worker --loglevel=INFO
+
+beat:
+	uv run celery -A app.worker beat --loglevel=INFO --schedule=/tmp/eve-celerybeat-schedule
 
 test:
 	uv run pytest -q

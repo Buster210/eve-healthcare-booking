@@ -14,18 +14,51 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
   api:
     build: .
-    environment:
+    image: ${COMPOSE_PROJECT_NAME:-eve}-api
+    environment: &app_environment
       DATABASE_URL: postgresql+psycopg://eve:eve@db:5432/eve
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
       WEBHOOK_SECRET: ${WEBHOOK_SECRET:?Set WEBHOOK_SECRET in .env}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  worker:
+    image: ${COMPOSE_PROJECT_NAME:-eve}-api
+    pull_policy: never
+    command: celery -A app.worker worker --loglevel=INFO
+    environment: *app_environment
+    depends_on:
+      api:
+        condition: service_started
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  beat:
+    image: ${COMPOSE_PROJECT_NAME:-eve}-api
+    pull_policy: never
+    command: celery -A app.worker beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule
+    environment: *app_environment
+    depends_on:
+      api:
+        condition: service_started
+      redis:
         condition: service_healthy
 volumes:
   postgres_data:

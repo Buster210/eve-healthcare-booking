@@ -1,13 +1,20 @@
+import logging
 import os
 from collections import OrderedDict
 from collections.abc import Callable
+from functools import lru_cache
 from math import ceil
 from threading import Lock
 from time import monotonic
 
 from fastapi import Request
+from redis import Redis
+from redis.exceptions import RedisError
 
+from app.config import get_settings
 from app.errors import AppError
+
+logger = logging.getLogger(__name__)
 
 RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() not in {
     "0",
@@ -19,6 +26,11 @@ MAX_IDENTITIES = 10_000
 _windows: OrderedDict[tuple[str, str], tuple[float, int]] = OrderedDict()
 _next_prune = 0.0
 _lock = Lock()
+
+
+@lru_cache
+def _redis_client(url: str) -> Redis:
+    return Redis.from_url(url, socket_connect_timeout=1, socket_timeout=1)
 
 
 def reset_rate_limits() -> None:
@@ -37,6 +49,26 @@ def rate_limit(key: str, limit: int, window_seconds: int) -> Callable[[Request],
         if not RATE_LIMIT_ENABLED:
             return
         identity = (key, request.client.host if request.client else "unknown")
+        redis_url = get_settings().redis_url
+        if redis_url:
+            try:
+                with _redis_client(redis_url).pipeline(transaction=True) as pipe:
+                    redis_key = f"eve:ratelimit:{key}:{identity[1]}"
+                    pipe.incr(redis_key)
+                    pipe.expire(redis_key, window_seconds, nx=True)
+                    pipe.ttl(redis_key)
+                    count, _, retry_after = pipe.execute()
+            except (RedisError, ValueError):
+                logger.warning("Redis rate limit unavailable; using in-memory limits")
+            else:
+                if count > limit:
+                    raise AppError(
+                        429,
+                        "RATE_LIMITED",
+                        "Too many requests",
+                        details={"retry_after": max(1, retry_after)},
+                    )
+                return
         with _lock:
             now = monotonic()
             if now >= _next_prune:
