@@ -8,6 +8,8 @@ Beyond the brief, the service also caches catalogue reads in Redis, shares auth 
 
 ### Docker
 
+For the Python helper commands below, install `uv` and run `uv sync --frozen` first.
+
 Copy the environment file and replace both signing secrets with random values of at least 32 characters:
 
 ```bash
@@ -53,6 +55,8 @@ uv run uvicorn app.main:app --reload
 | `TEST_DATABASE_URL` | Separate scratch database for tests; see below. |
 | `TEST_REDIS_URL` | Optional Redis URL for cache integration tests; tests skip those checks when unset. |
 | `RATE_LIMIT_ENABLED` | Auth rate limits default to enabled; `false`, `0` or `no` disables them. |
+
+Application, access, worker and beat log records are JSON; Celery, Uvicorn and Alembic startup banners are plain text.
 
 `ADMIN_EMAIL` and `ADMIN_PASSWORD` apply only to the seed command. Passwords must contain 8–128 characters. Do not commit `.env` or real credentials.
 
@@ -101,7 +105,7 @@ Use `Authorization: Bearer <token>` for authenticated requests. Catalogue reads 
 | `POST /payments/` | User | `{booking_id, simulate_outcome?}`; creates a simulated payment. |
 | `POST /payments/webhook/` | HMAC signature | `{event_id, provider_ref, status}`; applies a provider update. |
 
-Creation returns 201, reads and updates return 200, and successful deletes return 204. Duplicate emails, duplicate catalogue entries, active duplicate bookings, resources in use and invalid state changes return 409. Unknown resources return 404. Emails are matched case-insensitively; unknown email and incorrect password both return 401 at login.
+POST creation returns 201; `PUT` offering upserts return 200 for both creation and update. Reads and other updates return 200, and successful deletes return 204. Duplicate emails, duplicate catalogue entries, active duplicate bookings, resources in use and invalid state changes return 409. Unknown resources return 404. Emails are matched case-insensitively; unknown email and incorrect password both return 401 at login.
 
 Appointment times must include a timezone and be in the future. Offering prices must be positive. Database checks reject non-positive and `NaN` prices and amounts for offerings, bookings and payments. The server determines booking and payment amounts, rather than accepting amounts from the caller. NUL characters in user names, catalogue text fields and the centre search query return 422.
 
@@ -123,21 +127,21 @@ curl -s -X POST localhost:8000/auth/signup \
 LOGIN=$(curl -s -X POST localhost:8000/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"email":"patient@example.com","password":"local-demo-password"}')
-TOKEN=$(printf '%s' "$LOGIN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+TOKEN=$(printf '%s' "$LOGIN" | uv run python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 
-CENTRE_ID=$(curl -s 'localhost:8000/centres' | python3 -c 'import json,sys; print(json.load(sys.stdin)["items"][0]["id"])')
-TEST_ID=$(curl -s "localhost:8000/centres/$CENTRE_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tests"][0]["id"])')
-APPOINTMENT_AT=$(python3 -c 'from datetime import UTC,datetime,timedelta; print((datetime.now(UTC)+timedelta(days=1)).isoformat())')
+CENTRE_ID=$(curl -s 'localhost:8000/centres' | uv run python -c 'import json,sys; print(json.load(sys.stdin)["items"][0]["id"])')
+TEST_ID=$(curl -s "localhost:8000/centres/$CENTRE_ID" | uv run python -c 'import json,sys; print(json.load(sys.stdin)["tests"][0]["id"])')
+APPOINTMENT_AT=$(uv run python -c 'from datetime import UTC,datetime,timedelta; print((datetime.now(UTC)+timedelta(days=1)).isoformat())')
 
 BOOKING=$(curl -s -X POST localhost:8000/bookings \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "{\"centre_id\":$CENTRE_ID,\"test_id\":$TEST_ID,\"appointment_at\":\"$APPOINTMENT_AT\"}")
-BOOKING_ID=$(printf '%s' "$BOOKING" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+BOOKING_ID=$(printf '%s' "$BOOKING" | uv run python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
 PAYMENT=$(curl -s -X POST localhost:8000/payments/ \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "{\"booking_id\":$BOOKING_ID,\"simulate_outcome\":\"PENDING\"}")
-PROVIDER_REF=$(printf '%s' "$PAYMENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["provider_ref"])')
+PROVIDER_REF=$(printf '%s' "$PAYMENT" | uv run python -c 'import json,sys; print(json.load(sys.stdin)["provider_ref"])')
 
 uv run --env-file .env python -m scripts.send_webhook "$PROVIDER_REF" SUCCESS --base-url http://localhost:8000
 # Expected: {"result":"processed"}
@@ -189,6 +193,7 @@ Event IDs remain stored for replay detection. No retention job deletes them.
 ## Assumptions and trade-offs
 
 - Catalogue reads are public; only admins manage centres, tests and prices. Each booking belongs to the authenticated user.
+- Every five minutes, PENDING bookings older than 30 minutes with no PENDING or SUCCESS payment are CANCELLED in committed batches.
 - Centres have no availability calendar, opening hours or capacity limits. A future appointment time does not guarantee a physical slot.
 - Payments are simulated. The service does not collect card details, issue refunds or call a real payment gateway.
 - Synchronous SQLAlchemy keeps request handling and transactions straightforward. PostgreSQL supplies the row locks and constraints needed for concurrency.
