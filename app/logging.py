@@ -15,6 +15,10 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "request_id": request_id.get(),
         }
+        if record.exc_info:
+            data["exc_info"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            data["stack_info"] = record.stack_info
         for field in (
             "user_id",
             "centre_id",

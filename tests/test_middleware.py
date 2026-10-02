@@ -120,7 +120,9 @@ def test_unhandled_errors_keep_request_id_and_one_access_log(
     access = [row for row in events if row["message"] == "request_completed"]
     assert len(access) == 1
     assert access[0]["status"] == 500
-    assert any(row["message"] == "unhandled_exception" for row in events)
+    unhandled = [row for row in events if row["message"] == "unhandled_exception"]
+    assert len(unhandled) == 1
+    assert "RuntimeError: failure" in unhandled[0]["exc_info"]
 
 
 def test_access_log_records_authenticated_user_without_leaking_to_next_request(
@@ -145,3 +147,18 @@ def test_logs_outside_requests_have_null_request_id() -> None:
     data = json.loads(JsonFormatter().format(record))
     assert data["request_id"] is None
     assert (data["centre_id"], data["test_id"]) == (12, 34)
+
+
+def test_exception_logs_include_exception_and_stack_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.handler.setFormatter(JsonFormatter())
+    with caplog.at_level(logging.ERROR, logger="app.test"):
+        try:
+            raise ValueError("payment failed")
+        except ValueError:
+            logging.getLogger("app.test").exception("webhook failed", stack_info=True)
+
+    data = json.loads(caplog.text)
+    assert "ValueError: payment failed" in data["exc_info"]
+    assert data["stack_info"].startswith("Stack (most recent call last):")
