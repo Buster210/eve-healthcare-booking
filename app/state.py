@@ -1,4 +1,4 @@
-"""Booking/payment state machines — the ONLY place statuses change."""
+"""Allowed booking and payment transitions."""
 
 from typing import Protocol
 
@@ -6,7 +6,7 @@ from app.enums import BookingStatus, PaymentStatus
 
 
 class HasStatus(Protocol):
-    """Anything with a settable status (ORM row, SimpleNamespace in tests)."""
+    """Objects accepted by the transition helpers."""
 
     status: BookingStatus | PaymentStatus | str
 
@@ -15,8 +15,7 @@ class InvalidTransition(Exception):
     """Raised when a status change is not allowed by the transition table."""
 
 
-# Allowed next statuses per current status. Terminal states have no entry:
-# any transition out of them raises InvalidTransition.
+# Only pending entities can transition; the remaining states are terminal.
 BOOKING_TRANSITIONS: dict[str, frozenset[str]] = {
     BookingStatus.PENDING: frozenset(
         {BookingStatus.CONFIRMED, BookingStatus.FAILED, BookingStatus.CANCELLED}
@@ -43,9 +42,8 @@ def _validate_transition(
     else:
         raise InvalidTransition(f"Unknown status: {new_status!r}")
     current = entity.status
-    # StrEnum members compare by value, so PENDING == PENDING across families;
-    # tell them apart by type. A plain-str current (raw DB value) is accepted
-    # when it names a non-terminal state.
+    # Both enum families contain PENDING; check types to distinguish them.
+    # ORM models can expose the current status as a plain string.
     if type(current) is not type(new_status) and not (
         type(current) is str and current in table
     ):

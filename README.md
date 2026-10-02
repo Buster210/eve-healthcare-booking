@@ -1,199 +1,195 @@
-# Eve: diagnostic test booking backend
+# EVE diagnostic bookings API
 
-FastAPI and PostgreSQL backend for booking diagnostic tests at centres and paying through a simulated provider. Users can browse centres and tests with per-centre prices, book an appointment, and pay. A signed webhook resolves pending payments. The app uses sync SQLAlchemy and PostgreSQL; state changes go through the state-machine helpers in `app/state.py`.
+A FastAPI and PostgreSQL service for diagnostic test bookings and simulated payments. Users browse centres and their tests, book an appointment, and pay through a mock provider. Signed webhooks complete pending payments without processing the same event twice.
 
-## Running
+## Run locally
 
-With Docker:
+### Docker
+
+Copy the environment file and replace both signing secrets with random values of at least 32 characters:
 
 ```bash
-cp .env.example .env  # Set JWT_SECRET and WEBHOOK_SECRET in .env
+cp .env.example .env
 docker compose up --build
 ```
 
-This starts `db` (Postgres 17) and `api` (runs `alembic upgrade head`, then uvicorn). The API is available at `http://localhost:8000`; Swagger UI is at `/docs`. Compose binds API port 8000 and database port 5432 to localhost.
+Compose starts PostgreSQL 17 and the API, applying migrations before serving requests. The API runs at `http://localhost:8000`; Swagger UI is at `/docs`. Both exposed ports, 8000 and 5432, bind to localhost.
 
-Seed an admin and sample data:
+Create a development admin and sample catalogue:
 
 ```bash
 docker compose exec -e ADMIN_EMAIL=admin@example.com -e ADMIN_PASSWORD=change-this-password api python -m scripts.seed
 ```
 
-The seed script reads `ADMIN_EMAIL` and `ADMIN_PASSWORD`, creates or promotes that user to admin (dev only), and inserts sample centres, tests, and prices. It can be run repeatedly.
+The seed adds four centres, five tests and their prices. Running it again does not duplicate records. It creates or promotes `ADMIN_EMAIL` to admin; it does not reset an existing user's password. Keep this command restricted to trusted operators.
 
-Without Docker, with `uv`:
+### Local Python
+
+Use Python 3.12 or newer and `uv`. Start PostgreSQL separately, or use `docker compose up -d db` after configuring `.env`.
 
 ```bash
-cp .env.example .env
-uv sync
+cp .env.example .env  # Skip if already configured; replace the signing secrets.
+uv sync --frozen
 export DATABASE_URL=postgresql+psycopg://eve:eve@localhost:5432/eve
 uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 ```
 
-Common commands are also available through `make`: `make up`, `make down`,
-`make migrate`, `make seed`, `make run`, `make test`, `make lint`, and `make fmt`.
-`requests.http` contains end-to-end requests for clients such as the VS Code REST
-Client, with a terminal command to send the signed webhook using `WEBHOOK_SECRET`.
+`make` provides shortcuts for starting Docker, migrations, seeding, running the API, testing, linting and formatting. For local seeding, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` before running `make seed`.
 
-Tests require a separate PostgreSQL test database (they rely on `FOR UPDATE`, `ON CONFLICT`, and partial indexes; there is no SQLite fallback). Use `eve_test_pay` locally (CI uses `eve_test`). For example, use the Compose database:
+### Configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL connection URL using `postgresql+psycopg`; required. |
+| `JWT_SECRET` | HS256 signing key, at least 32 characters; required. |
+| `WEBHOOK_SECRET` | HMAC signing key, at least 32 characters; required. |
+| `JWT_EXPIRE_MINUTES` | Access-token lifetime; defaults to 60 minutes. |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`; defaults to `INFO`. |
+| `TEST_DATABASE_URL` | Separate scratch database for tests; see below. |
+| `RATE_LIMIT_ENABLED` | Auth rate limits default to enabled; `false`, `0` or `no` disables them. |
+
+`ADMIN_EMAIL` and `ADMIN_PASSWORD` apply only to the seed command. Passwords must contain 8–128 characters. Do not commit `.env` or real credentials.
+
+## Tests and CI
+
+Tests use PostgreSQL because the implementation depends on row locks, partial indexes and `ON CONFLICT`. **Tests truncate their database**, so they require a separate database whose name starts with `eve_test`.
+
+With the Compose database running:
 
 ```bash
 docker compose exec db createdb -U eve eve_test_pay
 export TEST_DATABASE_URL=postgresql+psycopg://eve:eve@localhost:5432/eve_test_pay
 make test
+uv run ruff check .
+uv run ruff format --check .
 ```
 
-## Environment
+Create the test database once. GitHub Actions uses `eve_test` on PostgreSQL 17 and runs dependency installation from `uv.lock`, lint, format checks and pytest on pushes and pull requests.
 
-- `DATABASE_URL`: required PostgreSQL DSN using `postgresql+psycopg`.
-- `JWT_SECRET`: required HS256 signing key, at least 32 characters.
-- `JWT_EXPIRE_MINUTES`: access token lifetime in minutes, defaults to 60.
-- `WEBHOOK_SECRET`: required HMAC key for webhook signatures.
-- `LOG_LEVEL`: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`; defaults to `INFO`.
-- `TEST_DATABASE_URL`: test database DSN; use a scratch database because test cases truncate tables.
-- `RATE_LIMIT_ENABLED`: signup and login rate limits are on by default; set to `false`, `0`, or `no` to disable.
+## API
 
-`ADMIN_EMAIL` and `ADMIN_PASSWORD` are read only by `scripts/seed.py`; password length is 8 to 128 characters.
+Use `Authorization: Bearer <token>` for authenticated requests. Catalogue reads are public; catalogue writes require an admin. Users can access only their own bookings and payments; another user's booking ID returns 404.
 
-## API overview
+| Method and path | Access | Request or result |
+| --- | --- | --- |
+| `GET /health` | Public | Liveness check: `{"status":"ok"}`. |
+| `GET /health/ready` | Public | Database check; returns 503 if unavailable. |
+| `POST /auth/signup` | Public | `{email, password, full_name}`; creates a user. |
+| `POST /auth/login` | Public | `{email, password}`; returns `{access_token, token_type, expires_in}`. |
+| `GET /auth/me` | User | Current user's profile. |
+| `GET /centres` | Public | Paginated centres; optional `q` searches name/location. |
+| `GET /centres/{id}` | Public | Centre details, offered tests and prices. |
+| `POST /centres` | Admin | `{name, location}`. |
+| `PATCH /centres/{id}` | Admin | Update `name` or `location`. |
+| `DELETE /centres/{id}` | Admin | Remove an empty centre; remove offerings first. |
+| `GET /tests` | Public | Paginated diagnostic tests. |
+| `POST /tests` | Admin | `{name, description?}`. |
+| `PATCH /tests/{id}` | Admin | Update `name` or `description`. |
+| `DELETE /tests/{id}` | Admin | Remove a test that is not in use. |
+| `PUT /centres/{id}/tests/{test_id}` | Admin | `{price}`; create or update the centre's test offering. |
+| `DELETE /centres/{id}/tests/{test_id}` | Admin | Remove an offering with no bookings. |
+| `POST /bookings` | User | `{centre_id, test_id, appointment_at}`; creates a `PENDING` booking. |
+| `GET /bookings` | User | Paginated bookings; optional `status` filter. |
+| `GET /bookings/{id}` | User | Booking details. |
+| `POST /bookings/{id}/cancel` | User | Cancel a pending booking with no pending payment. |
+| `POST /payments/` | User | `{booking_id, simulate_outcome?}`; creates a simulated payment. |
+| `POST /payments/webhook/` | HMAC signature | `{event_id, provider_ref, status}`; applies a provider update. |
 
-Errors use `{"error": {"code": "<SNAKE_CASE>", "message": "<human>", "details": ...}}`; `details` is omitted when absent. Validation errors return 422. Lists use `limit` (1–100, default 20) and `offset` (default 0), returning `{"items": [...], "total": n, "limit": l, "offset": o}`. Signup and login allow 10 requests per minute per client IP; excess requests return 429 with `details.retry_after`. Rate limiting is in-process single-worker state (`app/ratelimit.py:16`), so multi-worker deployments need a shared store such as Redis. The webhook and `POST /payments/` have no rate limit by design for this assignment (abuse note: add limits before production use). JWTs have no revocation list — logout means discarding the token client-side.
+Creation returns 201, reads and updates return 200, and successful deletes return 204. Duplicate emails, duplicate catalogue entries, active duplicate bookings, resources in use and invalid state changes return 409. Unknown resources return 404. Emails are matched case-insensitively; unknown email and incorrect password both return 401 at login.
 
-Health and auth (`Authorization: Bearer <jwt>`):
+Appointment times must include a timezone and be in the future. Offering prices must be positive. The server determines booking and payment amounts, rather than accepting amounts from the caller.
 
-- `GET /health` (200) returns `{"status":"ok"}`.
-- `GET /health/ready` (200) checks database connectivity and returns 503 when the database is unavailable.
-- Every HTTP response includes `X-Request-ID`. A supplied request ID is echoed; otherwise the server generates one. The ID also appears in the request completion log.
-- `POST /auth/signup` (public, 201): `{email, password, full_name}`; password must be 8–128 characters. Duplicate email, case-insensitive, returns 409.
-- `POST /auth/login` (public, 200): `{email, password}`; returns `{access_token, token_type: "bearer", expires_in}`. Unknown email and wrong password return the same 401.
-- `GET /auth/me` (auth, 200) returns `{id, email, full_name, is_admin, created_at}`.
+Lists accept `limit` (1–100, default 20) and `offset` (default 0), and return `{"items": [...], "total": n, "limit": l, "offset": o}`. Errors return `{"error": {"code": "...", "message": "...", "details": ...}}`; `details` is optional. Request validation failures return 422.
 
-Centres and tests: reads are public, writes need admin (`is_admin`, else 403):
+Responses include `X-Request-ID`, which also appears in the JSON request log. Signup and login allow 10 requests per minute per client IP; excess requests return 429 with `details.retry_after`.
 
-- `GET /centres`, `GET /centres/{id}` (200): paginated list with optional `q` filter on name/location; detail includes offered tests with prices.
-- `POST /centres` (201) accepts `{name, location}`; `PATCH /centres/{id}` (200) accepts either field. Duplicate centres return 409; missing centres return 404.
-- `DELETE /centres/{id}` (204) returns 409 when bookings reference the centre or offerings still exist (remove offerings first).
-- `GET /tests` (200), `POST /tests` (201) accepts `{name, description?}`, `PATCH /tests/{id}` (200) accepts either field, and `DELETE /tests/{id}` (204). Duplicate names return 409; missing tests return 404; delete returns 409 when in use.
-- `PUT /centres/{id}/tests/{test_id}` `{price}` (200) upserts an offering; price must be positive. Missing centre or test returns 404.
-- `DELETE /centres/{id}/tests/{test_id}` (204) removes an offering; missing offering is 404 and an offering with bookings returns 409.
+### Example: booking and payment
 
-Bookings (auth; another user's id returns 404):
-
-- `POST /bookings` `{centre_id, test_id, appointment_at}` (201) starts with status `PENDING` and `amount` copied from the current offering price. `appointment_at` must be timezone-aware and in the future; unknown offering is 404; an active duplicate slot is 409.
-- `GET /bookings` (200, optional `status` filter), `GET /bookings/{id}` (200).
-- `POST /bookings/{id}/cancel` (200) works only from `PENDING` with no pending payment, else 409 `INVALID_STATE`.
-
-Payments:
-
-- `POST /payments/` (auth, 201): `{booking_id, simulate_outcome?: "SUCCESS" | "FAILED" | "PENDING"}`; returns `{id, booking_id, amount, status, provider_ref, booking_status}`. If omitted, outcome is randomly `SUCCESS` or `FAILED`. `PENDING` leaves payment open for a webhook. Invalid booking state or duplicate active payment returns 409.
-- `POST /payments/webhook/` (no JWT, 200; `X-Signature: <hex hmac_sha256(WEBHOOK_SECRET, raw_body)>`): `{event_id, provider_ref, status}`, with status `SUCCESS` or `FAILED`. Returns `{"result": "processed" | "duplicate" | "no_op" | "ignored"}`; invalid signature is 401, unknown `provider_ref` is 404 and rolls back the event.
-
-Curl walkthrough (seed sample data first; API on `localhost:8000`). Use the same `WEBHOOK_SECRET` in `.env` as the running API:
+Seed the catalogue first. These commands use the API on port 8000 and the signing secret from the same `.env` used by the API. They create records; change the email when repeating signup.
 
 ```bash
-# signup
 curl -s -X POST localhost:8000/auth/signup \
   -H 'Content-Type: application/json' \
-  -d '{"email":"a@example.com","password":"password123","full_name":"Asha"}'
+  -d '{"email":"patient@example.com","password":"local-demo-password","full_name":"Asha"}'
 
-# login
 LOGIN=$(curl -s -X POST localhost:8000/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"email":"a@example.com","password":"password123"}')
-# -> {"access_token":"...","token_type":"bearer","expires_in":3600}
+  -d '{"email":"patient@example.com","password":"local-demo-password"}')
 TOKEN=$(printf '%s' "$LOGIN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 
-# choose a centre and one of its offered tests
-CENTRE_ID=$(curl -s 'localhost:8000/centres?limit=20&offset=0' | python3 -c 'import json,sys; print(json.load(sys.stdin)["items"][0]["id"])')
+CENTRE_ID=$(curl -s 'localhost:8000/centres' | python3 -c 'import json,sys; print(json.load(sys.stdin)["items"][0]["id"])')
 TEST_ID=$(curl -s "localhost:8000/centres/$CENTRE_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tests"][0]["id"])')
+APPOINTMENT_AT=$(python3 -c 'from datetime import UTC,datetime,timedelta; print((datetime.now(UTC)+timedelta(days=1)).isoformat())')
 
-# create booking (timezone-aware future datetime)
 BOOKING=$(curl -s -X POST localhost:8000/bookings \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d "{\"centre_id\":$CENTRE_ID,\"test_id\":$TEST_ID,\"appointment_at\":\"2030-01-01T10:00:00+05:30\"}")
+  -d "{\"centre_id\":$CENTRE_ID,\"test_id\":$TEST_ID,\"appointment_at\":\"$APPOINTMENT_AT\"}")
 BOOKING_ID=$(printf '%s' "$BOOKING" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
-# create a pending payment for the webhook to resolve
 PAYMENT=$(curl -s -X POST localhost:8000/payments/ \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "{\"booking_id\":$BOOKING_ID,\"simulate_outcome\":\"PENDING\"}")
-printf '%s\n' "$PAYMENT"
-# -> status: PENDING, booking_status: PENDING, provider_ref: sim_...
 PROVIDER_REF=$(printf '%s' "$PAYMENT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["provider_ref"])')
 
-# sign and send using WEBHOOK_SECRET from .env
 uv run --env-file .env python -m scripts.send_webhook "$PROVIDER_REF" SUCCESS --base-url http://localhost:8000
-# -> {"result":"processed"}
+# Expected: {"result":"processed"}
 
-# fetch the same booking: status is now CONFIRMED
 curl -s "localhost:8000/bookings/$BOOKING_ID" -H "Authorization: Bearer $TOKEN"
+# The booking is now CONFIRMED.
 ```
 
-The helper signs the exact bytes it sends and generates a fresh event ID. An exported `WEBHOOK_SECRET` takes precedence over `.env`; it must match the API's configured value.
+Omit `simulate_outcome` for a random `SUCCESS` or `FAILED`, or supply either value to test an immediate outcome. `PENDING` leaves the payment open for a webhook.
 
-`scripts/concurrency_demo.py` creates a user and booking, races concurrent
-payment requests, then sends duplicate webhook deliveries:
+`requests.http` provides the same flow for REST clients. To exercise concurrent payment requests and duplicate webhook deliveries:
 
 ```bash
-WEBHOOK_SECRET=supersecret uv run python -m scripts.concurrency_demo --requests 10
+uv run --env-file .env python -m scripts.concurrency_demo --requests 10
 ```
 
-## Schema
+Exported environment variables take precedence over `.env`. In particular, a helper's `WEBHOOK_SECRET` must match the running API.
 
-- `users` (`id`, `email`, `password_hash`, `full_name`, `is_admin`, `created_at`); email is lowercased before insert.
-- `centres` (`id`, `name`, `location`, `created_at`, `updated_at`); unique `(name, location)`.
-- `diagnostic_tests` (`id`, `name`, `description?`, `created_at`); unique `name`, with prices stored on offerings.
-- `centre_tests` (`id`, `centre_id -> centres CASCADE`, `test_id -> diagnostic_tests RESTRICT`, `price > 0`, `UNIQUE(centre_id, test_id)`): one price per centre/test pair. Although the FK has `CASCADE`, the API returns 409 while a centre still has offerings; remove them before deleting the centre. Tests and offerings referenced by bookings cannot be deleted (409).
-- `bookings` (`id`, `user_id`, `centre_id`, `test_id`, `appointment_at`, `amount`, `status`, `created_at`, `updated_at`); amount snapshots the offering price. A composite FK requires the test be offered at the centre; an active-slot partial unique index prevents duplicates while allowing rebooking after cancel or failure.
-- `payments` (`id`, `booking_id`, `amount`, `status`, `provider_ref`, `created_at`, `updated_at`); amount copies the booking amount. A partial unique index permits one pending or successful payment per booking.
-- `webhook_events` (`id`, `event_id`, `provider_ref`, `status`, `payload JSONB`, `received_at`); unique `event_id` deduplicates deliveries.
+## Database design
 
-Statuses are `varchar` plus `CHECK`, mirrored as Python `StrEnum` values.
+Models live in `app/models.py`; Alembic migrations create the schema.
 
-## Assumptions
+| Table | Role and relationships |
+| --- | --- |
+| `users` | Email, password hash, name and admin flag. Email is stored lowercase and unique. |
+| `centres` | Name and location, unique as a pair. |
+| `diagnostic_tests` | Unique test name and optional description. |
+| `centre_tests` | Joins a centre and test, with a positive `Numeric(10,2)` price. Each pair has one offering. |
+| `bookings` | User, centre, test, appointment time, amount snapshot and status. A composite foreign key requires a valid offering. |
+| `payments` | Booking, amount, status and unique provider reference. |
+| `webhook_events` | Unique event ID, provider reference, status, JSON payload and receipt time. |
 
-- Appointment times are supplied with a timezone and must be in the future; centres do not expose availability or capacity slots.
-- A booking uses the offering price at creation, even if that price changes later.
-- The payment provider is simulated. A pending payment is completed by a signed webhook; refunds and payment retries are outside this flow.
-- Webhook event IDs are unique per provider event, and delivery may be repeated.
+Money uses decimal columns rather than floating-point values; seed prices use INR. Appointment timestamps include timezone information. Status columns use database `CHECK` constraints alongside Python enums.
 
-## Design decisions
+Partial unique indexes allow one active booking per user/centre/test/time and one pending or successful payment per booking. Failed or cancelled bookings do not prevent rebooking. Bookings keep their original price even if an offering changes later.
 
-- Use synchronous FastAPI and SQLAlchemy with PostgreSQL, whose row locks and partial indexes enforce booking/payment concurrency rules.
-- Keep booking and payment transitions centralized in `app/state.py`; lock the booking before its payment when processing outcomes.
-- Store money as `Numeric(10, 2)`, sign webhooks with HMAC-SHA256 over the raw request body, and deduplicate events by `event_id`.
+The centre-to-offering foreign key uses `CASCADE`, but the API rejects centre deletion while offerings exist. Test deletion uses `RESTRICT`; offerings referenced by bookings cannot be removed. Offering upserts lock both the centre and test; centre deletion locks the centre before checking its offerings.
 
-## State transitions
+## Payment states and webhook handling
 
-Bookings move from `PENDING` to `CONFIRMED`, `FAILED`, or `CANCELLED`; payments move from `PENDING` to `SUCCESS` or `FAILED`. State changes go through the state-machine helpers in `app/state.py`: `transition()` validates a single transition, and `apply_payment_outcome()` validates both booking and payment transitions before mutating either status.
+Bookings move from `PENDING` to `CONFIRMED`, `FAILED` or `CANCELLED`. Payments move from `PENDING` to `SUCCESS` or `FAILED`. These outcomes are terminal; a failed booking needs a new booking before another payment attempt. `app/state.py` validates both payment and booking transitions before applying an outcome.
 
-## Webhook idempotency and concurrency
+The webhook requires `X-Signature` containing the hexadecimal HMAC-SHA256 of the **raw request bytes**. Signature verification uses `hmac.compare_digest` before accessing the database; missing or invalid signatures return 401.
 
-The HMAC is checked over raw request bytes with `hmac.compare_digest` before database access, so a bad signature does not consume an `event_id`. Webhook events are deduplicated by `event_id` in a transaction. Unknown `provider_ref` values roll back the event row, allowing a later retry. The booking row is locked before the payment row to serialize concurrent payment flows. An event matching the current payment status returns `no_op`; an illegal transition such as `FAILED` after `SUCCESS` returns `ignored` with HTTP 200.
+Within one transaction, the handler records the unique `event_id`, locks the booking before its payment, and applies the outcome. A duplicate event returns `duplicate`. An unknown provider reference returns 404 and rolls back the event, so a later retry can succeed. The handler returns `no_op` for an already-applied outcome and `ignored` for a conflicting terminal outcome, both with HTTP 200. Successful updates return `processed`.
 
-```text
-Client                 API / database                 Payment provider
-  | POST /bookings             |                               |
-  |--------------------------->| create PENDING booking       |
-  |                            |                               |
-  | POST /payments (PENDING)   |                               |
-  |--------------------------->| create PENDING payment       |
-  |<---------------------------| provider_ref                  |
-  |                            |<------------------------------| signed webhook
-  |                            | dedupe event; lock booking then payment
-  |                            | transition payment + booking |
-```
+Event IDs remain stored for replay detection. No retention job deletes them.
 
-## Improvements
+## Assumptions and trade-offs
 
-- Redis cache for the centre/test catalogue.
-- Celery and an outbox for webhook processing.
-- Refunds and a `REFUNDED` state path.
-- A shared rate-limit store for multiple workers.
-- Retry payments on a failed booking.
-- Centre availability slots with capacity and opening hours.
+- Catalogue reads are public; only admins manage centres, tests and prices. Each booking belongs to the authenticated user.
+- Centres have no availability calendar, opening hours or capacity limits. A future appointment time does not guarantee a physical slot.
+- Payments are simulated. The service does not collect card details, issue refunds or call a real payment gateway.
+- Synchronous SQLAlchemy keeps request handling and transactions straightforward. PostgreSQL supplies the row locks and constraints needed for concurrency.
+- Auth rate limits use process memory, so multiple workers would have separate counters. Payment and webhook routes currently have no rate limit. Apply deployment-level limits before exposing them publicly.
+- JWTs expire but have no revocation list. Discarding a token logs out the client; the token remains valid until expiry.
 
-## CI
+## With more time
 
-GitHub Actions runs on pushes and pull requests: `uv sync --frozen`, `ruff check .`, `ruff format --check .`, and `pytest -q` against PostgreSQL 17.
+- Model centre availability and capacity before accepting real appointments.
+- Define payment retry, refund and webhook reconciliation policies before integrating a provider. Add a background queue/outbox if processing needs to leave the request path.
+- Share auth rate-limit counters across workers, for example with Redis, and add limits for payment/webhook traffic. Cache the catalogue only if measurements justify it.

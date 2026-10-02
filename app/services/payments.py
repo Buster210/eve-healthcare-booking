@@ -92,7 +92,7 @@ def process_webhook(db: Session, data: WebhookPayload) -> str:
         if booking_id is None:
             raise NotFound("Payment not found")
 
-        # Every payment flow locks the booking first to avoid deadlocks.
+        # Match the other payment paths: lock the booking before its payment.
         booking = db.scalar(
             select(Booking).where(Booking.id == booking_id).with_for_update()
         )
@@ -105,8 +105,7 @@ def process_webhook(db: Session, data: WebhookPayload) -> str:
             result = "no_op"
         else:
             try:
-                # Isolate outcome database changes while retaining the webhook event.
-                # apply_payment_outcome validates both transitions before mutating.
+                # Keep the event recorded if the outcome is an invalid transition.
                 with db.begin_nested():
                     apply_payment_outcome(booking, payment, PaymentStatus(data.status))
             except InvalidTransition:
