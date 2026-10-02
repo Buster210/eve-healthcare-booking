@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session, object_session
 from app.config import get_settings
 from app.db import get_db
 from app.enums import BookingStatus, PaymentStatus
+from app.logging import JsonFormatter
 from app.models import Booking, CentreTest, Payment, User, WebhookEvent
 from app.schemas.payments import WebhookPayload
 from app.state import transition
@@ -481,6 +482,7 @@ def test_failed_webhook_retry_attempts_are_capped(
     db: Session,
     pending_payment: Payment,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     from app.services import payments
 
@@ -497,6 +499,16 @@ def test_failed_webhook_retry_attempts_are_capped(
         assert stored.attempts == attempts
         assert stored.status == "FAILED"
         assert stored.last_error == "Provider unavailable"
+        exhausted = [
+            record
+            for record in caplog.records
+            if record.message == "webhook_retries_exhausted"
+        ]
+        assert len(exhausted) == (attempts == 5)
+        if exhausted:
+            formatted = json.loads(JsonFormatter().format(exhausted[0]))
+            assert formatted["event_id"] == stored.event_id
+            assert formatted["attempts"] == 5
     assert payments.retry_failed_webhook_events(db) == 0
     db.refresh(stored)
     assert stored.attempts == 5

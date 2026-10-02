@@ -27,6 +27,7 @@ class JsonFormatter(logging.Formatter):
             "payment_id",
             "provider_ref",
             "event_id",
+            "attempts",
             "method",
             "path",
             "status",

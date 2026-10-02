@@ -207,6 +207,11 @@ def retry_failed_webhook_event(
             event.last_error = None
             result = "processed"
         event.attempts += 1
+        if result == "failed" and event.attempts >= max_attempts:
+            logger.warning(
+                "webhook_retries_exhausted",
+                extra={"event_id": event.event_id, "attempts": event.attempts},
+            )
     return last_id, result
 
 
