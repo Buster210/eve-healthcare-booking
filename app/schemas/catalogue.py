@@ -3,17 +3,17 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.schemas.common import Int4Id
+from app.schemas.common import Int4Id, NonNulString
 
 
 class CentreCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    location: str = Field(min_length=1, max_length=255)
+    name: NonNulString = Field(min_length=1, max_length=100)
+    location: NonNulString = Field(min_length=1, max_length=255)
 
 
 class CentreUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=100)
-    location: str | None = Field(default=None, min_length=1, max_length=255)
+    name: NonNulString | None = Field(default=None, min_length=1, max_length=100)
+    location: NonNulString | None = Field(default=None, min_length=1, max_length=255)
 
     @model_validator(mode="after")
     def require_change(self) -> "CentreUpdate":
@@ -28,16 +28,16 @@ class CentreResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: Int4Id
-    name: str
-    location: str
+    name: NonNulString
+    location: NonNulString
     created_at: datetime
     updated_at: datetime
 
 
 class OfferedTestResponse(BaseModel):
     id: Int4Id
-    name: str
-    description: str | None
+    name: NonNulString
+    description: NonNulString | None
     price: Decimal
 
 
@@ -46,13 +46,13 @@ class CentreDetailResponse(CentreResponse):
 
 
 class DiagnosticTestCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    description: str | None = None
+    name: NonNulString = Field(min_length=1, max_length=100)
+    description: NonNulString | None = None
 
 
 class DiagnosticTestUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=100)
-    description: str | None = None
+    name: NonNulString | None = Field(default=None, min_length=1, max_length=100)
+    description: NonNulString | None = None
 
     @model_validator(mode="after")
     def require_change(self) -> "DiagnosticTestUpdate":
@@ -67,8 +67,8 @@ class DiagnosticTestResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: Int4Id
-    name: str
-    description: str | None
+    name: NonNulString
+    description: NonNulString | None
     created_at: datetime
 
 

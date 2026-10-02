@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.db import get_db
 from app.models import User
 from app.schemas.catalogue import (
@@ -26,10 +27,16 @@ def list_all(
     db: Session = Depends(get_db),
 ) -> Page[DiagnosticTestResponse]:
     limit, offset = pagination
+    cache_key = cache.key("tests", limit, offset)
+    cached = cache.get_json(cache_key, Page[DiagnosticTestResponse])
+    if cached is not None:
+        return cached
     items, total = list_tests(db, limit, offset)
-    return Page[DiagnosticTestResponse](
+    response = Page[DiagnosticTestResponse](
         items=items, total=total, limit=limit, offset=offset
     )
+    cache.set_json(cache_key, response)
+    return response
 
 
 @router.post("", response_model=DiagnosticTestResponse, status_code=201)

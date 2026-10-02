@@ -1,7 +1,16 @@
 from typing import Annotated
 
 from fastapi import Query
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
+
+
+def _reject_nul(value: str) -> str:
+    if "\x00" in value:
+        raise ValueError("must not contain NUL characters")
+    return value
+
+
+NonNulString = Annotated[str, AfterValidator(_reject_nul)]
 
 Int4Id = Annotated[int, Field(gt=0, le=2_147_483_647)]
 

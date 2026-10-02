@@ -6,6 +6,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.errors import Conflict, NotFound
 from app.models import Centre, CentreTest, DiagnosticTest
 from app.schemas.catalogue import (
@@ -61,6 +62,7 @@ def create_centre(db: Session, payload: CentreCreate) -> Centre:
         if _constraint_name(exc) == "uq_centres_name_location":
             raise Conflict("Centre already exists") from exc
         raise
+    cache.invalidate()
     db.refresh(centre)
     return centre
 
@@ -78,6 +80,7 @@ def update_centre(db: Session, centre_id: int, payload: CentreUpdate) -> Centre:
         if _constraint_name(exc) == "uq_centres_name_location":
             raise Conflict("Centre already exists") from exc
         raise
+    cache.invalidate()
     db.refresh(centre)
     return centre
 
@@ -102,6 +105,7 @@ def delete_centre(db: Session, centre_id: int) -> None:
         if _constraint_name(exc) == "fk_bookings_centre_test":
             raise Conflict("Centre has bookings and cannot be deleted") from exc
         raise
+    cache.invalidate()
 
 
 def list_tests(
@@ -124,6 +128,7 @@ def create_test(db: Session, payload: DiagnosticTestCreate) -> DiagnosticTest:
         if _constraint_name(exc) == "uq_diagnostic_tests_name":
             raise Conflict("Test already exists") from exc
         raise
+    cache.invalidate()
     db.refresh(test)
     return test
 
@@ -143,12 +148,13 @@ def update_test(
         if _constraint_name(exc) == "uq_diagnostic_tests_name":
             raise Conflict("Test already exists") from exc
         raise
+    cache.invalidate()
     db.refresh(test)
     return test
 
 
 def delete_test(db: Session, test_id: int) -> None:
-    test = db.get(DiagnosticTest, test_id)
+    test = db.get(DiagnosticTest, test_id, with_for_update=True)
     if test is None:
         raise NotFound("Test not found")
     try:
@@ -162,6 +168,7 @@ def delete_test(db: Session, test_id: int) -> None:
         }:
             raise Conflict("Test is in use and cannot be deleted") from exc
         raise
+    cache.invalidate()
 
 
 def upsert_offering(
@@ -181,6 +188,7 @@ def upsert_offering(
         .returning(CentreTest)
     )
     db.commit()
+    cache.invalidate()
     assert offering is not None
     logger.info(
         "offering_upserted",
@@ -206,3 +214,4 @@ def delete_offering(db: Session, centre_id: int, test_id: int) -> None:
         if _constraint_name(exc) == "fk_bookings_centre_test":
             raise Conflict("Offering has bookings and cannot be deleted") from exc
         raise
+    cache.invalidate()

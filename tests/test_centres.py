@@ -1,6 +1,9 @@
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from threading import Event
+from time import monotonic, sleep
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +11,7 @@ from sqlalchemy import Insert, Select, delete, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from app.errors import AppError
 from app.models import Booking, Centre, CentreTest, DiagnosticTest, User
 from app.services import catalogue
 
@@ -444,3 +448,97 @@ def test_catalogue_pagination_beyond_last_item_returns_empty_page(
     response = client.get(path, params={"limit": 100, "offset": 100})
     assert response.status_code == 200
     assert response.json() == {"items": [], "total": 0, "limit": 100, "offset": 100}
+
+
+@pytest.mark.parametrize("field", ["name", "location"])
+@pytest.mark.parametrize("method", ["POST", "PATCH"])
+def test_centre_strings_reject_nul(
+    client: TestClient,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    field: str,
+    method: str,
+) -> None:
+    headers = _admin_headers(make_user, auth_headers)
+    payload = {"name": "Clinic", "location": "City"}
+    created = client.post("/centres", json=payload, headers=headers).json()
+    path = "/centres" if method == "POST" else f"/centres/{created['id']}"
+    payload[field] = "before\x00after"
+    response = client.request(method, path, json=payload, headers=headers)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert client.get(f"/centres/{created['id']}").json()[field] == created[field]
+
+
+def test_centre_search_rejects_nul(client: TestClient) -> None:
+    response = client.get("/centres", params={"q": "before\x00after"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("parent", [Centre, DiagnosticTest], ids=["centre", "test"])
+@pytest.mark.parametrize(
+    "delete_first", [True, False], ids=["delete-first", "upsert-first"]
+)
+def test_parent_delete_races_offering_upsert(
+    db: Session,
+    make_offering: Callable[..., CentreTest],
+    monkeypatch: pytest.MonkeyPatch,
+    parent: type[Centre] | type[DiagnosticTest],
+    delete_first: bool,
+) -> None:
+    offering = make_offering()
+    cid, tid = offering.centre_id, offering.test_id
+    db.delete(offering)
+    db.commit()
+    started = Event()
+    pids: list[int] = []
+
+    def run(session: Session, deleting: bool) -> int:
+        try:
+            if deleting:
+                if parent is Centre:
+                    catalogue.delete_centre(session, cid)
+                else:
+                    catalogue.delete_test(session, tid)
+                return 204
+            catalogue.upsert_offering(session, cid, tid, Decimal("10.00"))
+            return 200
+        except AppError as exc:
+            return exc.status_code
+
+    def second() -> int:
+        with Session(db.get_bind(), expire_on_commit=False) as session:
+            session.execute(text("SET LOCAL statement_timeout = '5s'"))
+            pids.append(session.scalar(text("SELECT pg_backend_pid()")))
+            started.set()
+            return run(session, not delete_first)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with Session(db.get_bind(), expire_on_commit=False) as first:
+            commit = first.commit
+            futures = []
+
+            def interleave() -> None:
+                first.flush()
+                futures.append(executor.submit(second))
+                assert started.wait(2)
+                deadline = monotonic() + 2
+                while not first.scalar(
+                    text(
+                        "SELECT EXISTS (SELECT 1 FROM pg_locks "
+                        "WHERE pid = :pid AND NOT granted)"
+                    ),
+                    {"pid": pids[0]},
+                ):
+                    assert monotonic() < deadline, "Concurrent request did not block"
+                    sleep(0.01)
+                commit()
+
+            monkeypatch.setattr(first, "commit", interleave)
+            assert run(first, delete_first) == (204 if delete_first else 200)
+        assert futures[0].result(timeout=10) == (404 if delete_first else 409)
+    assert (
+        bool(db.scalar(select(CentreTest.id).where(CentreTest.centre_id == cid)))
+        is not delete_first
+    )

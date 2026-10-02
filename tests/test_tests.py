@@ -371,3 +371,23 @@ def test_seed_requires_admin_environment(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
     with pytest.raises(SystemExit, match="ADMIN_EMAIL and ADMIN_PASSWORD"):
         seed.main()
+
+
+@pytest.mark.parametrize("field", ["name", "description"])
+@pytest.mark.parametrize("method", ["POST", "PATCH"])
+def test_diagnostic_test_strings_reject_nul(
+    client: TestClient,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    field: str,
+    method: str,
+) -> None:
+    headers = _admin_headers(make_user, auth_headers)
+    payload = {"name": "CBC", "description": "Blood count"}
+    created = client.post("/tests", json=payload, headers=headers).json()
+    path = "/tests" if method == "POST" else f"/tests/{created['id']}"
+    payload[field] = "before\x00after"
+    response = client.request(method, path, json=payload, headers=headers)
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert client.get("/tests").json()["items"][0][field] == created[field]

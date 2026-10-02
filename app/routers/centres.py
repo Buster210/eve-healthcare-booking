@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from app import cache
 from app.db import get_db
 from app.models import User
 from app.schemas.catalogue import (
@@ -12,7 +13,7 @@ from app.schemas.catalogue import (
     OfferingResponse,
     OfferingUpsert,
 )
-from app.schemas.common import Int4Id, Page, pagination_params
+from app.schemas.common import Int4Id, NonNulString, Page, pagination_params
 from app.security import require_admin
 from app.services.catalogue import (
     create_centre,
@@ -29,19 +30,31 @@ router = APIRouter(prefix="/centres", tags=["centres"])
 
 @router.get("", response_model=Page[CentreResponse])
 def list_all(
-    q: str | None = Query(default=None),
+    q: NonNulString | None = Query(default=None),
     pagination: tuple[int, int] = Depends(pagination_params),
     db: Session = Depends(get_db),
 ) -> Page[CentreResponse]:
     limit, offset = pagination
+    cache_key = cache.key("centres", limit, offset, q)
+    cached = cache.get_json(cache_key, Page[CentreResponse])
+    if cached is not None:
+        return cached
     items, total = list_centres(db, limit, offset, q)
-    return Page[CentreResponse](items=items, total=total, limit=limit, offset=offset)
+    response = Page[CentreResponse](
+        items=items, total=total, limit=limit, offset=offset
+    )
+    cache.set_json(cache_key, response)
+    return response
 
 
 @router.get("/{centre_id}", response_model=CentreDetailResponse)
 def get_one(centre_id: Int4Id, db: Session = Depends(get_db)) -> CentreDetailResponse:
+    cache_key = cache.key("centre", centre_id)
+    cached = cache.get_json(cache_key, CentreDetailResponse)
+    if cached is not None:
+        return cached
     centre, offerings = get_centre_detail(db, centre_id)
-    return CentreDetailResponse(
+    response = CentreDetailResponse(
         id=centre.id,
         name=centre.name,
         location=centre.location,
@@ -57,6 +70,8 @@ def get_one(centre_id: Int4Id, db: Session = Depends(get_db)) -> CentreDetailRes
             for test, price in offerings
         ],
     )
+    cache.set_json(cache_key, response)
+    return response
 
 
 @router.post("", response_model=CentreResponse, status_code=201)
