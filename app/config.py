@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     jwt_secret: SecretStr = Field(min_length=32)
     jwt_expire_minutes: int = Field(default=60, gt=0)
     webhook_secret: SecretStr = Field(min_length=32)
+    redis_url: str | None = None
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
 
     @field_validator("jwt_secret", "webhook_secret")
