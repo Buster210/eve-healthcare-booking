@@ -1,6 +1,7 @@
 import os
 from collections.abc import Iterator
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -244,7 +245,8 @@ def test_redis_limits_shared_across_clients_and_expire(
         assert response.status_code == 429
         assert 1 <= response.json()["error"]["details"]["retry_after"] <= 10
         redis_key = f"eve:ratelimit:{key}:testclient"
-        assert int(redis.get(redis_key)) == 3
+        count = cast(str, redis.get(redis_key))
+        assert int(count) == 3
         redis.expire(redis_key, 2)
         assert second.get("/").status_code == 429
         assert 0 < redis.ttl(redis_key) <= 2

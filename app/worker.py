@@ -1,8 +1,9 @@
 import logging
 from datetime import timedelta
+from typing import cast
 
-from celery import Celery
-from celery.signals import beat_init, worker_init
+from celery import Celery  # type: ignore[import-untyped]
+from celery.signals import beat_init, worker_init  # type: ignore[import-untyped]
 from celery.signals import setup_logging as celery_setup_logging
 from sqlalchemy.exc import OperationalError
 
@@ -52,12 +53,12 @@ celery_setup_logging.connect(_setup_celery_logging)
 @app.task(autoretry_for=(OperationalError,), retry_backoff=True, max_retries=5)
 def expire_stale_bookings() -> int:
     count = 0
-    last_id = 0
+    last_id: int | None = 0
     with SessionLocal() as db:
         try:
             while True:
                 cancelled, last_id = bookings.expire_stale_bookings(
-                    db, timedelta(minutes=30), after_id=last_id
+                    db, timedelta(minutes=30), after_id=cast(int, last_id)
                 )
                 if last_id is None:
                     break

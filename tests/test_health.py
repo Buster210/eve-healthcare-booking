@@ -1,9 +1,9 @@
 from collections.abc import Iterator
 from time import perf_counter
-from typing import Annotated
+from typing import Annotated, cast
 
 import pytest
-from fastapi import Body, Depends, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.exc import OperationalError
@@ -22,9 +22,8 @@ def test_health(client: TestClient) -> None:
 
 @pytest.fixture
 def ready_engine(db: Session, monkeypatch: pytest.MonkeyPatch) -> Iterator[Engine]:
-    engine = create_engine(
-        db.get_bind().url, pool_size=1, max_overflow=0, pool_timeout=1
-    )
+    bind = cast(Engine, db.get_bind())
+    engine = create_engine(bind.url, pool_size=1, max_overflow=0, pool_timeout=1)
     monkeypatch.setattr(main, "readiness_engine", engine)
     yield engine
     engine.dispose()
@@ -111,7 +110,7 @@ def test_method_not_allowed(client: TestClient) -> None:
 def test_uniform_errors(
     client: TestClient, error: Exception, status: int, code: str
 ) -> None:
-    @client.app.get("/_error")
+    @cast(FastAPI, client.app).get("/_error")
     def fail() -> None:
         raise error
 
@@ -127,7 +126,7 @@ def test_uniform_errors(
 
 
 def test_validation_does_not_echo_input(client: TestClient) -> None:
-    @client.app.post("/_validate")
+    @cast(FastAPI, client.app).post("/_validate")
     def validate(value: Annotated[int, Body()]) -> dict[str, int]:
         return {"value": value}
 
@@ -150,7 +149,7 @@ def test_validation_does_not_echo_input(client: TestClient) -> None:
     ],
 )
 def test_pagination(client: TestClient, query: str, status: int) -> None:
-    @client.app.get("/_page")
+    @cast(FastAPI, client.app).get("/_page")
     def page(
         params: Annotated[tuple[int, int], Depends(pagination_params)],
     ) -> Page[int]:

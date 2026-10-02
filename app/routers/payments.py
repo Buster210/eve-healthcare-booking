@@ -1,7 +1,7 @@
 import hashlib
 import hmac
 import logging
-from typing import Annotated
+from typing import Annotated, Literal, cast
 
 from fastapi import APIRouter, Depends, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
@@ -88,4 +88,8 @@ def webhook(
     result = process_webhook(db, data)
     if result == "queued":
         response.status_code = 202
-    return WebhookResponse(result=result)
+    return WebhookResponse(
+        result=cast(
+            Literal["duplicate", "no_op", "ignored", "processed", "queued"], result
+        )
+    )

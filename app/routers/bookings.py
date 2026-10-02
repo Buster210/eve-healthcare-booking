@@ -1,3 +1,5 @@
+from typing import cast
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -35,7 +37,12 @@ def list_own(
 ) -> Page[BookingResponse]:
     limit, offset = pagination
     items, total = list_bookings(db, user.id, limit, offset, status)
-    return Page[BookingResponse](items=items, total=total, limit=limit, offset=offset)
+    return Page[BookingResponse](
+        items=cast(list[BookingResponse], items),
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{booking_id}", response_model=BookingResponse)

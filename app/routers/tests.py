@@ -1,3 +1,5 @@
+from typing import cast
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
@@ -33,7 +35,10 @@ def list_all(
         return cached
     items, total = list_tests(db, limit, offset)
     response = Page[DiagnosticTestResponse](
-        items=items, total=total, limit=limit, offset=offset
+        items=cast(list[DiagnosticTestResponse], items),
+        total=total,
+        limit=limit,
+        offset=offset,
     )
     cache.set_json(cache_key, response)
     return response

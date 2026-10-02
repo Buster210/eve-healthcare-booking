@@ -7,12 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
-from sqlalchemy import func, select, text
+from sqlalchemy import Select, delete, func, select, text
 from sqlalchemy.orm import Session, object_session
 
 from app.config import get_settings
@@ -50,7 +51,8 @@ def pending_payment(
         json={"booking_id": booking.id, "simulate_outcome": "PENDING"},
     )
     assert response.status_code == 201, response.text
-    return db.get(Payment, response.json()["id"])
+    payment = cast(Payment, db.get(Payment, response.json()["id"]))
+    return payment
 
 
 def signed_body(payload: dict[str, str]) -> dict[str, Any]:
@@ -179,9 +181,11 @@ def test_bad_signature_is_rejected_before_database_work(
         pytest.fail("Unsigned webhook reached the database dependency")
 
     monkeypatch.setitem(
-        client.app.dependency_overrides, get_db, unexpected_database_work
+        cast(FastAPI, client.app).dependency_overrides, get_db, unexpected_database_work
     )
-    headers = {} if signature is None else {"X-Signature": signature}
+    headers: dict[str, str] | dict[bytes, bytes] = (
+        {} if signature is None else {"X-Signature": signature}
+    )
     # Invalid JSON must still fail authentication before parsing.
     if signature == "é":
         headers = {b"X-Signature": signature.encode()}
@@ -244,7 +248,8 @@ def test_webhook_resolves_pending_payment(
     assert response.json() == {"result": "processed"}
     db.refresh(pending_payment)
     assert pending_payment.status == outcome
-    assert db.get(Booking, pending_payment.booking_id).status == booking_status
+    stored_booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
+    assert stored_booking.status == booking_status
     stored = db.scalars(select(WebhookEvent)).one()
     assert stored.payload == event(pending_payment, status=outcome)
 
@@ -295,18 +300,19 @@ def test_duplicate_webhook_does_not_change_booking(
     assert second.json() == {"result": "duplicate"}
     db.refresh(pending_payment)
     assert pending_payment.status == PaymentStatus.SUCCESS
-    assert db.get(Booking, pending_payment.booking_id).status == BookingStatus.CONFIRMED
+    stored_booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
+    assert stored_booking.status == BookingStatus.CONFIRMED
     assert db.scalar(select(func.count()).select_from(WebhookEvent)) == 1
     duplicate = next(
         record for record in caplog.records if record.message == "webhook_duplicate"
     )
-    assert duplicate.event_id == payload["event_id"]
+    assert duplicate.__dict__["event_id"] == payload["event_id"]
 
 
 def test_illegal_booking_transition_undoes_payment_change(
     client: TestClient, db: Session, pending_payment: Payment
 ) -> None:
-    booking = db.get(Booking, pending_payment.booking_id)
+    booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
     transition(booking, BookingStatus.CANCELLED)
     db.commit()
     response = client.post("/payments/webhook/", **signed_body(event(pending_payment)))
@@ -346,6 +352,46 @@ def test_unknown_payment_event_can_be_retried(
     retry = client.post("/payments/webhook/", **signed_body(payload))
     assert retry.status_code == 200, retry.text
     assert retry.json() == {"result": "processed"}
+
+
+def test_booking_deleted_between_webhook_lookups_rolls_back_event(
+    client: TestClient,
+    db: Session,
+    pending_payment: Payment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = event(pending_payment)
+    booking_id = pending_payment.booking_id
+    payment_id = pending_payment.id
+    original_scalar = Session.scalar
+    lookups = []
+
+    def delete_after_payment_lookup(
+        session: Session, statement: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        result = original_scalar(session, statement, *args, **kwargs)
+        if isinstance(statement, Select):
+            expression = statement.column_descriptions[0]["expr"]
+            if expression is Payment.booking_id:
+                lookups.append("booking_id")
+                with Session(session.get_bind()) as deleting:
+                    deleting.execute(delete(Payment).where(Payment.id == payment_id))
+                    deleting.execute(delete(Booking).where(Booking.id == booking_id))
+                    deleting.commit()
+            elif expression is Booking or expression is Payment:
+                lookups.append(expression.__name__)
+                assert result is None
+        return result
+
+    monkeypatch.setattr(Session, "scalar", delete_after_payment_lookup)
+    response = client.post("/payments/webhook/", **signed_body(payload))
+    assert response.status_code == 404, response.text
+    assert response.json() == {
+        "error": {"code": "NOT_FOUND", "message": "Payment not found"}
+    }
+    assert lookups == ["booking_id", "Booking", "Payment"]
+    with Session(db.get_bind()) as observer:
+        assert observer.scalar(select(func.count()).select_from(WebhookEvent)) == 0
 
 
 @pytest.mark.parametrize("outcome", ["SUCCESS", "FAILED"])
@@ -390,7 +436,8 @@ def test_stale_outcome_is_ignored(
     assert response.json() == {"result": "ignored"}
     db.refresh(pending_payment)
     assert pending_payment.status == first
-    assert db.get(Booking, pending_payment.booking_id).status == booking_status
+    stored_booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
+    assert stored_booking.status == booking_status
     assert db.scalar(select(func.count()).select_from(WebhookEvent)) == 2
     assert any(record.message == "webhook_ignored" for record in caplog.records)
 
@@ -405,7 +452,7 @@ def test_elapsed_appointment_webhook_settles_pending_payment(
     outcome: str,
     booking_status: str,
 ) -> None:
-    booking = db.get(Booking, pending_payment.booking_id)
+    booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
     booking.appointment_at = datetime.now(UTC) - timedelta(seconds=1)
     db.commit()
     response = client.post(
@@ -439,7 +486,7 @@ def test_webhook_failure_is_queued_and_retry_processes(
         booking: Booking, payment: Payment, outcome: PaymentStatus | str
     ) -> None:
         apply_outcome(booking, payment, outcome)
-        session = object_session(payment)
+        session = cast(Session, object_session(payment))
         session.flush()
         if failure == "database":
             session.execute(text("SELECT 1 / 0"))
@@ -452,7 +499,8 @@ def test_webhook_failure_is_queued_and_retry_processes(
     assert response.json() == {"result": "queued"}
     db.refresh(pending_payment)
     assert pending_payment.status == PaymentStatus.PENDING
-    assert db.get(Booking, pending_payment.booking_id).status == BookingStatus.PENDING
+    stored_booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
+    assert stored_booking.status == BookingStatus.PENDING
     stored = db.scalars(select(WebhookEvent)).one()
     assert stored.status == "FAILED"
     assert stored.attempts == 1
@@ -473,7 +521,8 @@ def test_webhook_failure_is_queued_and_retry_processes(
     assert stored.attempts == 2
     assert stored.last_error is None
     assert pending_payment.status == PaymentStatus.SUCCESS
-    assert db.get(Booking, pending_payment.booking_id).status == BookingStatus.CONFIRMED
+    stored_booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
+    assert stored_booking.status == BookingStatus.CONFIRMED
     assert payments.retry_failed_webhook_events(db) == 0
 
 
@@ -548,7 +597,7 @@ def test_webhook_retry_settles_terminal_outcomes(
     from app.services.payments import retry_failed_webhook_events
     from app.state import apply_payment_outcome
 
-    booking = db.get(Booking, pending_payment.booking_id)
+    booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
     if terminal == "no_op":
         apply_payment_outcome(booking, pending_payment, PaymentStatus.SUCCESS)
     else:
@@ -580,7 +629,7 @@ def test_webhook_retry_failure_does_not_block_other_events(
     from app import worker
     from app.services import payments
 
-    booking = db.get(Booking, pending_payment.booking_id)
+    booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
     second_booking = Booking(
         user_id=booking.user_id,
         centre_id=booking.centre_id,
@@ -619,7 +668,7 @@ def test_webhook_retry_failure_does_not_block_other_events(
     ) -> None:
         apply_outcome(booking, payment, outcome)
         if payment.id == pending_payment.id and failure == "database":
-            session = object_session(payment)
+            session = cast(Session, object_session(payment))
             session.flush()
             session.execute(text("SELECT 1 / 0"))
         if payment.id == second_payment.id:
@@ -679,8 +728,8 @@ def test_webhook_retry_preserves_caller_transaction(
 ) -> None:
     from app.services import payments
 
-    booking = db.get(Booking, pending_payment.booking_id)
-    user = db.get(User, booking.user_id)
+    booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
+    user = cast(User, db.get(User, booking.user_id))
     original_name = user.full_name
     if result != "empty":
         db.add(
@@ -694,7 +743,8 @@ def test_webhook_retry_preserves_caller_transaction(
     db.commit()
 
     def fail_outcome(*args: object) -> None:
-        object_session(pending_payment).execute(text("SELECT 1 / 0"))
+        session = cast(Session, object_session(pending_payment))
+        session.execute(text("SELECT 1 / 0"))
 
     if result == "failed":
         monkeypatch.setattr(payments, "apply_payment_outcome", fail_outcome)
@@ -712,11 +762,13 @@ def test_webhook_retry_preserves_caller_transaction(
         else:
             assert payments.retry_failed_webhook_events(db) == (result == "processed")
         assert user.full_name == "Pending caller change"
-        assert other.get(User, user.id).full_name == original_name
+        stored_user = cast(User, other.get(User, user.id))
+        assert stored_user.full_name == original_name
         db.rollback()
         assert user.full_name == original_name
         other.expire_all()
-        assert other.get(User, user.id).full_name == original_name
+        stored_user = cast(User, other.get(User, user.id))
+        assert stored_user.full_name == original_name
 
 
 def test_concurrent_webhooks_process_event_only_once(
@@ -740,4 +792,5 @@ def test_concurrent_webhooks_process_event_only_once(
     assert db.scalar(select(func.count()).select_from(WebhookEvent)) == 1
     db.refresh(pending_payment)
     assert pending_payment.status == PaymentStatus.SUCCESS
-    assert db.get(Booking, pending_payment.booking_id).status == BookingStatus.CONFIRMED
+    stored_booking = cast(Booking, db.get(Booking, pending_payment.booking_id))
+    assert stored_booking.status == BookingStatus.CONFIRMED

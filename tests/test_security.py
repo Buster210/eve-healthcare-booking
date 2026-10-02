@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from inspect import unwrap
+from typing import Annotated, cast
 from unittest.mock import MagicMock, Mock
 
 import conftest
@@ -23,11 +24,11 @@ from app.security import (
 
 @pytest.fixture
 def secured_client(client: TestClient) -> TestClient:
-    @client.app.get("/_me")
+    @cast(FastAPI, client.app).get("/_me")
     def me(user: Annotated[User, Depends(get_current_user)]) -> dict[str, int]:
         return {"id": user.id}
 
-    @client.app.get("/_admin")
+    @cast(FastAPI, client.app).get("/_admin")
     def admin(user: Annotated[User, Depends(require_admin)]) -> dict[str, int]:
         return {"id": user.id}
 
@@ -176,7 +177,7 @@ def test_database_url_guard_rejects_overrides_before_connecting(
     monkeypatch.setattr(conftest, "create_engine", create_engine)
     monkeypatch.setattr(conftest.command, "upgrade", upgrade)
     with pytest.raises(pytest.fail.Exception):
-        next(conftest.test_engine.__wrapped__())
+        next(unwrap(conftest.test_engine)())
     create_engine.assert_not_called()
     upgrade.assert_not_called()
 
@@ -193,7 +194,7 @@ def test_connected_database_guard_runs_before_migration(
     upgrade = Mock()
     monkeypatch.setattr(conftest.command, "upgrade", upgrade)
     with pytest.raises(pytest.fail.Exception, match="Connected database"):
-        next(conftest.test_engine.__wrapped__())
+        next(unwrap(conftest.test_engine)())
     assert str(connection.scalar.call_args.args[0]) == "SELECT current_database()"
     upgrade.assert_not_called()
     engine.dispose.assert_called_once()
@@ -204,6 +205,6 @@ def test_connected_database_guard_runs_before_cleanup() -> None:
     connection = engine.begin.return_value.__enter__.return_value
     connection.scalar.return_value = "eve"
     with pytest.raises(pytest.fail.Exception, match="Connected database"):
-        next(conftest.db.__wrapped__(engine))
+        next(unwrap(conftest.db)(engine))
     assert str(connection.scalar.call_args.args[0]) == "SELECT current_database()"
     connection.execute.assert_not_called()

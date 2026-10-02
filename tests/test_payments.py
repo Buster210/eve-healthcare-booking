@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from threading import Barrier
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -63,8 +64,10 @@ def test_payment_outcome_updates_booking(
     assert data["status"] == outcome
     assert data["booking_status"] == booking_status
     db.expire_all()
-    assert db.get(Booking, row.id).status == booking_status
-    assert db.get(Payment, data["id"]).status == outcome
+    stored_booking = cast(Booking, db.get(Booking, row.id))
+    assert stored_booking.status == booking_status
+    stored_payment = cast(Payment, db.get(Payment, data["id"]))
+    assert stored_payment.status == outcome
 
 
 def test_payment_uses_booking_price_snapshot(
@@ -74,10 +77,13 @@ def test_payment_uses_booking_price_snapshot(
     auth_headers: Callable[[User], dict[str, str]],
 ) -> None:
     row, user = booking
-    offering = db.scalar(
-        select(CentreTest).where(
-            CentreTest.centre_id == row.centre_id, CentreTest.test_id == row.test_id
-        )
+    offering = cast(
+        CentreTest,
+        db.scalar(
+            select(CentreTest).where(
+                CentreTest.centre_id == row.centre_id, CentreTest.test_id == row.test_id
+            )
+        ),
     )
     original_amount = row.amount
     offering.price = Decimal("999.00")
@@ -168,7 +174,8 @@ def test_failed_booking_accepts_another_payment(
     assert response.json()["id"] != first.json()["id"]
     assert response.json()["status"] == outcome
     db.expire_all()
-    assert db.get(Payment, first.json()["id"]).status == PaymentStatus.FAILED
+    stored_payment = cast(Payment, db.get(Payment, first.json()["id"]))
+    assert stored_payment.status == PaymentStatus.FAILED
     assert db.scalar(select(func.count()).select_from(Payment)) == 2
 
 
@@ -335,12 +342,14 @@ def test_payment_logs_include_payment_and_booking_ids(
         for record in caplog.records
         if record.message in ("payment_created", "payment_resolved")
     ]
-    assert {record.event for record in records} == {
+    assert {record.__dict__["event"] for record in records} == {
         "payment_created",
         "payment_resolved",
     }
-    assert all(record.booking_id == row.id for record in records)
-    assert all(record.payment_id == response.json()["id"] for record in records)
+    assert all(record.__dict__["booking_id"] == row.id for record in records)
+    assert all(
+        record.__dict__["payment_id"] == response.json()["id"] for record in records
+    )
 
 
 def test_invalid_outcome_is_rejected(

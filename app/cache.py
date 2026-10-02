@@ -1,6 +1,7 @@
 import json
 import logging
 from functools import lru_cache
+from typing import cast
 
 from pydantic import BaseModel
 from redis import Redis
@@ -43,7 +44,8 @@ def key(*parts: str | int | None) -> str | None:
     try:
         client = _redis()
         if client is not None:
-            version = client.get(VERSION_KEY) or "0"
+            # The client uses decode_responses=True, so GET returns text.
+            version = cast(str | None, client.get(VERSION_KEY)) or "0"
             return f"catalogue:{version}:{json.dumps(parts, ensure_ascii=True)}"
     except (RedisError, ValueError):
         _warn_once()

@@ -1,9 +1,11 @@
 import json
 import logging
 from collections.abc import Callable
+from typing import cast
 from uuid import UUID
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
@@ -75,7 +77,7 @@ def test_middleware_and_exception_handlers_can_be_registered_before_start() -> N
 def test_access_and_application_logs_share_request_id(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
-    @client.app.get("/_logged")
+    @cast(FastAPI, client.app).get("/_logged")
     def logged() -> dict[str, str]:
         logging.getLogger("app.test").info("application_event")
         return {"status": "ok"}
@@ -102,7 +104,7 @@ def test_access_and_application_logs_share_request_id(
 def test_unhandled_errors_keep_request_id_and_one_access_log(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
-    @client.app.get("/_broken")
+    @cast(FastAPI, client.app).get("/_broken")
     def broken() -> None:
         raise RuntimeError("failure")
 
@@ -137,8 +139,8 @@ def test_access_log_records_authenticated_user_without_leaking_to_next_request(
         assert client.get("/health").status_code == 200
     access = [record for record in caplog.records if record.msg == "request_completed"]
     assert len(access) == 2
-    assert access[0].user_id == user.id
-    assert access[1].user_id is None
+    assert access[0].__dict__["user_id"] == user.id
+    assert access[1].__dict__["user_id"] is None
 
 
 def test_logs_outside_requests_have_null_request_id() -> None:

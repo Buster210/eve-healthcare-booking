@@ -1,6 +1,8 @@
 import logging
 from datetime import UTC, datetime
+from typing import cast
 
+from psycopg import Error as PsycopgError
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
@@ -29,11 +31,11 @@ def create_payment(db: Session, user_id: int, data: PaymentCreate) -> PaymentRes
             raise InvalidState("Booking must be pending or failed to accept a payment")
         if booking.appointment_at <= datetime.now(UTC):
             raise InvalidState("Booking appointment must be in the future")
-        attempts = db.scalar(
+        attempts = db.execute(
             select(func.count())
             .select_from(Payment)
             .where(Payment.booking_id == booking.id)
-        )
+        ).scalar_one()
         if attempts >= 3:
             raise Conflict("Payment attempt limit reached", code="PAYMENT_LIMIT")
         if booking.status == BookingStatus.FAILED:
@@ -54,16 +56,17 @@ def create_payment(db: Session, user_id: int, data: PaymentCreate) -> PaymentRes
             id=payment.id,
             booking_id=booking.id,
             amount=payment.amount,
-            status=payment.status,
+            status=cast(PaymentStatus, payment.status),
             provider_ref=payment.provider_ref,
-            booking_status=booking.status,
+            booking_status=cast(BookingStatus, booking.status),
         )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        if exc.orig.diag.constraint_name == "uq_payments_active_booking":
+        constraint = cast(PsycopgError, exc.orig).diag.constraint_name
+        if constraint == "uq_payments_active_booking":
             raise Conflict("Payment already exists", code="PAYMENT_EXISTS") from exc
-        if exc.orig.diag.constraint_name == "uq_bookings_active_slot":
+        if constraint == "uq_bookings_active_slot":
             raise Conflict("An active booking already exists for this slot") from exc
         raise
     except Exception:
@@ -152,7 +155,9 @@ def _apply_webhook_outcome(
             if payment.status == data.status:
                 result = "no_op"
             else:
-                apply_payment_outcome(booking, payment, PaymentStatus(data.status))
+                apply_payment_outcome(
+                    cast(Booking, booking), payment, PaymentStatus(data.status)
+                )
                 result = "processed"
     except InvalidTransition:
         result = "ignored"

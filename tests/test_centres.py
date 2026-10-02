@@ -4,9 +4,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from threading import Event
 from time import monotonic, sleep
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
+from psycopg import Error as PsycopgError
 from sqlalchemy import Insert, Select, delete, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -276,7 +278,7 @@ def test_delete_centre_blocks_offering_insert_after_empty_check(
                 inserting.add(CentreTest(centre_id=cid, test_id=tid, price=10))
                 with pytest.raises(OperationalError) as error:
                     inserting.commit()
-                assert error.value.orig.sqlstate == "55P03"
+                assert cast(PsycopgError, error.value.orig).sqlstate == "55P03"
             return result
 
         monkeypatch.setattr(deleting, "scalar", interleave)
@@ -306,7 +308,7 @@ def test_upsert_offering_blocks_parent_delete_after_validation(
                 deleting.execute(text("SET LOCAL lock_timeout = '200ms'"))
                 with pytest.raises(OperationalError) as error:
                     deleting.execute(delete(parent).where(parent.id == parent_id))
-                assert error.value.orig.sqlstate == "55P03"
+                assert cast(PsycopgError, error.value.orig).sqlstate == "55P03"
             return scalar(statement)
 
         monkeypatch.setattr(inserting, "scalar", interleave)

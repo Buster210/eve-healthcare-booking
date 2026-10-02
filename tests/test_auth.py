@@ -1,9 +1,10 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
 import jwt
 import pytest
-from fastapi import Depends
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -133,7 +134,7 @@ def test_admin_guard_rejects_anonymous_and_regular_users(
     make_user: Callable[..., User],
     auth_headers: Callable[[User], dict[str, str]],
 ) -> None:
-    @client.app.get("/_auth_test/admin")
+    @cast(FastAPI, client.app).get("/_auth_test/admin")
     def admin_only(user: User = Depends(require_admin)) -> dict[str, int]:
         return {"id": user.id}
 

@@ -1,6 +1,8 @@
 import logging
+from typing import cast
 
 from fastapi import APIRouter, Depends
+from psycopg import Error as PsycopgError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -40,7 +42,7 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)) -> User:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        if exc.orig.diag.constraint_name == "uq_users_email":
+        if cast(PsycopgError, exc.orig).diag.constraint_name == "uq_users_email":
             raise Conflict("Email already registered") from exc
         raise
     db.refresh(user)
@@ -58,7 +60,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
     if not verify_password(payload.password, user.password_hash if user else None):
         raise Unauthorized("Invalid email or password")
     return TokenResponse(
-        access_token=create_access_token(user.id),
+        access_token=create_access_token(cast(User, user).id),
         expires_in=get_settings().jwt_expire_minutes * 60,
     )
 

@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -94,7 +95,7 @@ def test_offering_deleted_after_lookup_returns_not_found(
     offering = make_offering()
     original_scalar = Session.scalar
 
-    def delete_after_offering_lookup(session: Session, *args: object, **kwargs: object):
+    def delete_after_offering_lookup(session: Session, *args: Any, **kwargs: Any):
         result = original_scalar(session, *args, **kwargs)
         if isinstance(result, CentreTest):
             with Session(session.get_bind()) as deleting:
@@ -129,7 +130,7 @@ def test_user_deleted_after_lookup_returns_unauthorized(
     headers = auth_headers(user)
     original_scalar = Session.scalar
 
-    def delete_after_offering_lookup(session: Session, *args: object, **kwargs: object):
+    def delete_after_offering_lookup(session: Session, *args: Any, **kwargs: Any):
         result = original_scalar(session, *args, **kwargs)
         if isinstance(result, CentreTest):
             with Session(session.get_bind()) as deleting:
@@ -381,7 +382,7 @@ def test_expire_stale_bookings(
     headers = auth_headers(make_user())
     payload = booking_payload(make_offering())
     booking_id = client.post("/bookings", json=payload, headers=headers).json()["id"]
-    booking = db.get(Booking, booking_id)
+    booking = cast(Booking, db.get(Booking, booking_id))
     booking.created_at = now - timedelta(minutes=age)
     if status != BookingStatus.PENDING:
         transition(booking, status)
@@ -499,7 +500,7 @@ def test_expiry_skips_locked_bookings(
     from app.services.bookings import expire_stale_bookings
 
     created = create_booking(client, auth_headers(make_user()), make_offering())
-    booking = db.get(Booking, created["id"])
+    booking = cast(Booking, db.get(Booking, created["id"]))
     booking.created_at = datetime.now(UTC) - timedelta(hours=1)
     db.commit()
     with Session(db.get_bind()) as other:

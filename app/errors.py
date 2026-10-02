@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Mapping
 from math import ceil
 
 from fastapi import FastAPI, Request
@@ -69,7 +70,7 @@ def error_response(
     code: str,
     message: str,
     details: object | None = None,
-    headers: dict[str, str] | None = None,
+    headers: Mapping[str, str] | None = None,
 ) -> JSONResponse:
     error: dict[str, object] = {"code": code, "message": message}
     if details is not None:

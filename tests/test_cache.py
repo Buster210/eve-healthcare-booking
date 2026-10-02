@@ -1,6 +1,7 @@
 import os
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -179,7 +180,7 @@ def test_cache_keys_include_filters_and_pagination(
             page = client.get(path, params={"limit": 1, "offset": 1}).json()
             assert [item["name"] for item in page["items"]] == ["Beta"]
             assert client.get(path, params={"offset": 2}).json()["items"] == []
-    cache_key = cache.key("centres", 20, 0, "Alpha")
+    cache_key = cast(str, cache.key("centres", 20, 0, "Alpha"))
     assert 0 < catalogue_redis.ttl(cache_key) <= cache.TTL
 
 

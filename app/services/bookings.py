@@ -1,6 +1,8 @@
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
+from psycopg import Error as PsycopgError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -79,7 +81,7 @@ def create_booking(db: Session, user_id: int, payload: BookingCreate) -> Booking
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        constraint_name = exc.orig.diag.constraint_name
+        constraint_name = cast(PsycopgError, exc.orig).diag.constraint_name
         if constraint_name == "uq_bookings_active_slot":
             raise Conflict("An active booking already exists for this slot") from exc
         if constraint_name == "fk_bookings_centre_test":

@@ -1,9 +1,11 @@
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import cast
 
 import pytest
-from sqlalchemy import Engine, insert, inspect
+from psycopg import Error as PsycopgError
+from sqlalchemy import Engine, Table, insert, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -28,7 +30,8 @@ def test_migrated_query_indexes_match_metadata(
         for index in inspect(test_engine).get_indexes(model.__tablename__)
         if index["name"] == name
     )
-    declared = next(index for index in model.__table__.indexes if index.name == name)
+    table = cast(Table, model.__table__)
+    declared = next(index for index in table.indexes if index.name == name)
     assert (
         migrated["column_names"]
         == [column.name for column in declared.columns]
@@ -79,5 +82,5 @@ def test_money_constraints_reject_direct_inserts(
         constraint = f"ck_{model.__tablename__}_amount_positive"
     with pytest.raises(IntegrityError) as caught:
         db.execute(insert(model).values(**values))
-    assert caught.value.orig.diag.constraint_name == constraint
+    assert cast(PsycopgError, caught.value.orig).diag.constraint_name == constraint
     db.rollback()
