@@ -97,7 +97,7 @@ def test_signup_centre_booking_success_and_confirmed_booking_cannot_be_cancelled
     assert cancelled.json()["error"]["code"] == "INVALID_STATE"
 
 
-def test_failed_payment_marks_booking_failed(
+def test_failed_payment_can_be_retried_on_the_same_booking(
     client: TestClient, make_offering: Callable[..., CentreTest]
 ) -> None:
     headers = register_and_login(client, "failed@example.com")
@@ -116,6 +116,19 @@ def test_failed_payment_marks_booking_failed(
     stored = client.get(f"/bookings/{booking['id']}", headers=headers)
     assert stored.status_code == 200, stored.text
     assert stored.json()["status"] == BookingStatus.FAILED
+
+    retry = client.post(
+        "/payments/",
+        headers=headers,
+        json={"booking_id": booking["id"], "simulate_outcome": "SUCCESS"},
+    )
+    assert retry.status_code == 201, retry.text
+    assert retry.json()["id"] != payment.json()["id"]
+    assert retry.json()["booking_id"] == booking["id"]
+    assert retry.json()["status"] == PaymentStatus.SUCCESS
+    assert retry.json()["booking_status"] == BookingStatus.CONFIRMED
+    stored = client.get(f"/bookings/{booking['id']}", headers=headers)
+    assert stored.json()["status"] == BookingStatus.CONFIRMED
 
 
 def test_pending_payment_webhook_resolves_once_and_rejects_bad_signature(

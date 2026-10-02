@@ -28,4 +28,4 @@ class WebhookPayload(BaseModel):
 
 
 class WebhookResponse(BaseModel):
-    result: Literal["duplicate", "no_op", "ignored", "processed"]
+    result: Literal["duplicate", "no_op", "ignored", "processed", "queued"]

@@ -3,7 +3,7 @@ import hmac
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
@@ -53,7 +53,11 @@ def pay(
 
 @router.post("/webhook/", response_model=WebhookResponse)
 def webhook(
+    response: Response,
     data: Annotated[WebhookPayload, Depends(signed_payload)],
     db: Annotated[Session, Depends(get_db)],
 ) -> WebhookResponse:
-    return WebhookResponse(result=process_webhook(db, data))
+    result = process_webhook(db, data)
+    if result == "queued":
+        response.status_code = 202
+    return WebhookResponse(result=result)

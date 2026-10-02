@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -106,16 +107,14 @@ def test_second_pending_payment_returns_payment_exists(
     assert db.scalar(select(func.count()).select_from(Payment)) == 1
 
 
-@pytest.mark.parametrize("outcome", ["SUCCESS", "FAILED"])
 def test_terminal_booking_rejects_second_payment(
     client: TestClient,
     db: Session,
     booking: tuple[Booking, User],
     auth_headers: Callable[[User], dict[str, str]],
-    outcome: str,
 ) -> None:
     row, user = booking
-    payload = {"booking_id": row.id, "simulate_outcome": outcome}
+    payload = {"booking_id": row.id, "simulate_outcome": "SUCCESS"}
     headers = auth_headers(user)
     assert client.post("/payments/", headers=headers, json=payload).status_code == 201
     response = client.post("/payments/", headers=headers, json=payload)
@@ -142,6 +141,137 @@ def test_other_users_booking_is_not_found(
     assert db.scalar(select(func.count()).select_from(Payment)) == 0
     db.refresh(row)
     assert row.status == BookingStatus.PENDING
+
+
+@pytest.mark.parametrize("outcome", ["PENDING", "SUCCESS", "FAILED"])
+def test_failed_booking_accepts_another_payment(
+    client: TestClient,
+    db: Session,
+    booking: tuple[Booking, User],
+    auth_headers: Callable[[User], dict[str, str]],
+    outcome: str,
+) -> None:
+    row, user = booking
+    headers = auth_headers(user)
+    first = client.post(
+        "/payments/",
+        headers=headers,
+        json={"booking_id": row.id, "simulate_outcome": "FAILED"},
+    )
+    assert first.status_code == 201, first.text
+    response = client.post(
+        "/payments/",
+        headers=headers,
+        json={"booking_id": row.id, "simulate_outcome": outcome},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["id"] != first.json()["id"]
+    assert response.json()["status"] == outcome
+    db.expire_all()
+    assert db.get(Payment, first.json()["id"]).status == PaymentStatus.FAILED
+    assert db.scalar(select(func.count()).select_from(Payment)) == 2
+
+
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("elapsed", [0, 1])
+def test_payment_rejects_elapsed_appointment(
+    client: TestClient,
+    db: Session,
+    booking: tuple[Booking, User],
+    auth_headers: Callable[[User], dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    retry: bool,
+    elapsed: int,
+) -> None:
+    from app.services import payments
+
+    row, user = booking
+    headers = auth_headers(user)
+    if retry:
+        response = client.post(
+            "/payments/",
+            headers=headers,
+            json={"booking_id": row.id, "simulate_outcome": "FAILED"},
+        )
+        assert response.status_code == 201, response.text
+    now = row.appointment_at + timedelta(seconds=elapsed)
+    monkeypatch.setattr(
+        payments, "datetime", SimpleNamespace(now=lambda tz: now), raising=False
+    )
+    response = client.post(
+        "/payments/",
+        headers=headers,
+        json={"booking_id": row.id, "simulate_outcome": "SUCCESS"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "INVALID_STATE"
+    db.refresh(row)
+    assert row.status == (BookingStatus.FAILED if retry else BookingStatus.PENDING)
+    assert db.scalar(select(func.count()).select_from(Payment)) == int(retry)
+
+
+def test_payment_attempts_are_capped_at_three(
+    client: TestClient,
+    db: Session,
+    booking: tuple[Booking, User],
+    auth_headers: Callable[[User], dict[str, str]],
+) -> None:
+    row, user = booking
+    headers = auth_headers(user)
+    for _ in range(3):
+        response = client.post(
+            "/payments/",
+            headers=headers,
+            json={"booking_id": row.id, "simulate_outcome": "FAILED"},
+        )
+        assert response.status_code == 201, response.text
+    response = client.post(
+        "/payments/",
+        headers=headers,
+        json={"booking_id": row.id, "simulate_outcome": "SUCCESS"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "PAYMENT_LIMIT"
+    db.refresh(row)
+    assert row.status == BookingStatus.FAILED
+    assert db.scalar(select(func.count()).select_from(Payment)) == 3
+
+
+@pytest.mark.parametrize("outcome", ["PENDING", "SUCCESS", "FAILED"])
+def test_retry_returns_conflict_when_slot_is_taken(
+    client: TestClient,
+    db: Session,
+    booking: tuple[Booking, User],
+    auth_headers: Callable[[User], dict[str, str]],
+    outcome: str,
+) -> None:
+    row, user = booking
+    headers = auth_headers(user)
+    response = client.post(
+        "/payments/",
+        headers=headers,
+        json={"booking_id": row.id, "simulate_outcome": "FAILED"},
+    )
+    assert response.status_code == 201, response.text
+    replacement = Booking(
+        user_id=row.user_id,
+        centre_id=row.centre_id,
+        test_id=row.test_id,
+        appointment_at=row.appointment_at,
+        amount=row.amount,
+    )
+    db.add(replacement)
+    db.commit()
+    response = client.post(
+        "/payments/",
+        headers=headers,
+        json={"booking_id": row.id, "simulate_outcome": outcome},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "CONFLICT"
+    db.refresh(row)
+    assert row.status == BookingStatus.FAILED
+    assert db.scalar(select(func.count()).select_from(Payment)) == 1
 
 
 def test_unknown_booking_is_not_found(
@@ -266,16 +396,25 @@ def test_omitted_outcome_uses_simulator(
     )
 
 
+@pytest.mark.parametrize("retry", [False, True])
 def test_payment_failure_rolls_back_every_change(
     client: TestClient,
     db: Session,
     booking: tuple[Booking, User],
     auth_headers: Callable[[User], dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
+    retry: bool,
 ) -> None:
     from app.services import payments
 
     row, user = booking
+    if retry:
+        response = client.post(
+            "/payments/",
+            headers=auth_headers(user),
+            json={"booking_id": row.id, "simulate_outcome": "FAILED"},
+        )
+        assert response.status_code == 201, response.text
     apply_outcome = payments.apply_payment_outcome
 
     def fail_after_outcome(
@@ -293,19 +432,28 @@ def test_payment_failure_rolls_back_every_change(
         )
     assert response.status_code == 500, response.text
     db.refresh(row)
-    assert row.status == BookingStatus.PENDING
-    assert db.scalar(select(func.count()).select_from(Payment)) == 0
+    assert row.status == (BookingStatus.FAILED if retry else BookingStatus.PENDING)
+    assert db.scalar(select(func.count()).select_from(Payment)) == int(retry)
 
 
+@pytest.mark.parametrize("retry", [False, True])
 def test_concurrent_payments_create_only_one_payment(
     client: TestClient,
     db: Session,
     booking: tuple[Booking, User],
     auth_headers: Callable[[User], dict[str, str]],
+    retry: bool,
 ) -> None:
     row, user = booking
     payload = {"booking_id": row.id, "simulate_outcome": "PENDING"}
     headers = auth_headers(user)
+    if retry:
+        response = client.post(
+            "/payments/",
+            headers=headers,
+            json={"booking_id": row.id, "simulate_outcome": "FAILED"},
+        )
+        assert response.status_code == 201, response.text
     barrier = Barrier(6)
 
     def pay(_: int) -> Response:
@@ -322,6 +470,6 @@ def test_concurrent_payments_create_only_one_payment(
         for response in responses
         if response.status_code == 409
     )
-    assert db.scalar(select(func.count()).select_from(Payment)) == 1
+    assert db.scalar(select(func.count()).select_from(Payment)) == 1 + int(retry)
     db.refresh(row)
     assert row.status == BookingStatus.PENDING

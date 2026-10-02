@@ -8,6 +8,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    Integer,
     MetaData,
     Numeric,
     String,
@@ -86,7 +87,9 @@ class CentreTest(Base):
     __tablename__ = "centre_tests"
     __table_args__ = (
         UniqueConstraint("centre_id", "test_id", name="uq_centre_tests_centre_test"),
-        CheckConstraint("price > 0", name="ck_centre_tests_price_positive"),
+        CheckConstraint(
+            "price > 0 AND price <> 'NaN'", name="ck_centre_tests_price_positive"
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -109,6 +112,9 @@ class Booking(Base):
         CheckConstraint(
             "status IN ('PENDING', 'CONFIRMED', 'FAILED', 'CANCELLED')",
             name="ck_bookings_status",
+        ),
+        CheckConstraint(
+            "amount > 0 AND amount <> 'NaN'", name="ck_bookings_amount_positive"
         ),
         Index("ix_bookings_user_created_at", "user_id", text("created_at DESC")),
         Index(
@@ -146,6 +152,9 @@ class Payment(Base):
         CheckConstraint(
             "status IN ('PENDING', 'SUCCESS', 'FAILED')", name="ck_payments_status"
         ),
+        CheckConstraint(
+            "amount > 0 AND amount <> 'NaN'", name="ck_payments_amount_positive"
+        ),
         Index(
             "uq_payments_active_booking",
             "booking_id",
@@ -173,13 +182,20 @@ class WebhookEvent(Base):
     __tablename__ = "webhook_events"
     __table_args__ = (
         UniqueConstraint("event_id", name="uq_webhook_events_event_id"),
+        CheckConstraint(
+            "status IN ('PROCESSED', 'FAILED')", name="ck_webhook_events_status"
+        ),
         Index("ix_webhook_events_provider_ref", "provider_ref"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event_id: Mapped[str] = mapped_column(String(100))
     provider_ref: Mapped[str] = mapped_column(String(100))
-    status: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(
+        String(20), default="PROCESSED", server_default="PROCESSED"
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    last_error: Mapped[str | None] = mapped_column(Text)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

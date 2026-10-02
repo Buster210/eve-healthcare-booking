@@ -15,11 +15,11 @@ class InvalidTransition(Exception):
     """Raised when a status change is not allowed by the transition table."""
 
 
-# Only pending entities can transition; the remaining states are terminal.
 BOOKING_TRANSITIONS: dict[str, frozenset[str]] = {
     BookingStatus.PENDING: frozenset(
         {BookingStatus.CONFIRMED, BookingStatus.FAILED, BookingStatus.CANCELLED}
     ),
+    BookingStatus.FAILED: frozenset({BookingStatus.PENDING}),
 }
 
 PAYMENT_TRANSITIONS: dict[str, frozenset[str]] = {
@@ -55,7 +55,6 @@ def _validate_transition(
 
 
 def transition(entity: HasStatus, new_status: BookingStatus | PaymentStatus) -> None:
-    """Move entity to new_status or raise InvalidTransition."""
     _validate_transition(entity, new_status)
     entity.status = new_status
 

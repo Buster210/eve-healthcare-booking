@@ -5,13 +5,14 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
+from time import monotonic
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select, text
+from sqlalchemy.orm import Session, object_session
 
 from app.config import get_settings
 from app.db import get_db
@@ -296,11 +297,14 @@ def test_stale_outcome_is_ignored(
     assert any(record.message == "webhook_ignored" for record in caplog.records)
 
 
-def test_webhook_failure_rolls_back_and_retry_processes(
+@pytest.mark.parametrize("failure", ["runtime", "database"])
+def test_webhook_failure_is_queued_and_retry_processes(
     client: TestClient,
     db: Session,
     pending_payment: Payment,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
 ) -> None:
     from app.services import payments
 
@@ -310,21 +314,273 @@ def test_webhook_failure_rolls_back_and_retry_processes(
         booking: Booking, payment: Payment, outcome: PaymentStatus | str
     ) -> None:
         apply_outcome(booking, payment, outcome)
+        session = object_session(payment)
+        session.flush()
+        if failure == "database":
+            session.execute(text("SELECT 1 / 0"))
         raise RuntimeError("Simulated transaction failure")
 
     request = signed_body(event(pending_payment))
     monkeypatch.setattr(payments, "apply_payment_outcome", fail_after_outcome)
-    with TestClient(client.app, raise_server_exceptions=False) as request_client:
-        response = request_client.post("/payments/webhook/", **request)
-    assert response.status_code == 500, response.text
+    response = client.post("/payments/webhook/", **request)
+    assert response.status_code == 202, response.text
+    assert response.json() == {"result": "queued"}
     db.refresh(pending_payment)
     assert pending_payment.status == PaymentStatus.PENDING
     assert db.get(Booking, pending_payment.booking_id).status == BookingStatus.PENDING
-    assert db.scalar(select(func.count()).select_from(WebhookEvent)) == 0
+    stored = db.scalars(select(WebhookEvent)).one()
+    assert stored.status == "FAILED"
+    assert stored.attempts == 1
+    assert stored.last_error
+    assert stored.payload == event(pending_payment)
+    assert any(record.message == "webhook_failed" for record in caplog.records)
+    duplicate = client.post("/payments/webhook/", **request)
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json() == {"result": "duplicate"}
+    db.refresh(stored)
+    assert stored.attempts == 1
+    assert stored.status == "FAILED"
     monkeypatch.setattr(payments, "apply_payment_outcome", apply_outcome)
-    response = client.post("/payments/webhook/", **request)
-    assert response.status_code == 200, response.text
-    assert response.json() == {"result": "processed"}
+    assert payments.retry_failed_webhook_events(db) == 1
+    db.refresh(stored)
+    db.refresh(pending_payment)
+    assert stored.status == "PROCESSED"
+    assert stored.attempts == 2
+    assert stored.last_error is None
+    assert pending_payment.status == PaymentStatus.SUCCESS
+    assert db.get(Booking, pending_payment.booking_id).status == BookingStatus.CONFIRMED
+    assert payments.retry_failed_webhook_events(db) == 0
+
+
+def test_failed_webhook_retry_attempts_are_capped(
+    client: TestClient,
+    db: Session,
+    pending_payment: Payment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services import payments
+
+    def fail_outcome(*args: object) -> None:
+        raise RuntimeError("Provider unavailable")
+
+    monkeypatch.setattr(payments, "apply_payment_outcome", fail_outcome)
+    response = client.post("/payments/webhook/", **signed_body(event(pending_payment)))
+    assert response.status_code == 202, response.text
+    stored = db.scalars(select(WebhookEvent)).one()
+    for attempts in range(2, 6):
+        assert payments.retry_failed_webhook_events(db) == 0
+        db.refresh(stored)
+        assert stored.attempts == attempts
+        assert stored.status == "FAILED"
+        assert stored.last_error == "Provider unavailable"
+    assert payments.retry_failed_webhook_events(db) == 0
+    db.refresh(stored)
+    assert stored.attempts == 5
+    db.refresh(pending_payment)
+    assert pending_payment.status == PaymentStatus.PENDING
+
+
+def test_failed_webhook_retry_skips_locked_events(
+    db: Session, pending_payment: Payment
+) -> None:
+    from app.services.payments import retry_failed_webhook_events
+
+    stored = WebhookEvent(
+        event_id="evt-locked",
+        provider_ref=pending_payment.provider_ref,
+        status="FAILED",
+        payload=event(pending_payment, event_id="evt-locked"),
+        last_error="Temporary failure",
+    )
+    db.add(stored)
+    db.commit()
+    with Session(db.bind) as other:
+        other.scalar(
+            select(WebhookEvent).where(WebhookEvent.id == stored.id).with_for_update()
+        )
+        assert retry_failed_webhook_events(db) == 0
+        db.refresh(stored)
+        assert stored.attempts == 1
+        other.rollback()
+    assert retry_failed_webhook_events(db) == 1
+
+
+@pytest.mark.parametrize("terminal", ["no_op", "ignored"])
+def test_webhook_retry_settles_terminal_outcomes(
+    db: Session, pending_payment: Payment, terminal: str
+) -> None:
+    from app.services.payments import retry_failed_webhook_events
+    from app.state import apply_payment_outcome
+
+    booking = db.get(Booking, pending_payment.booking_id)
+    if terminal == "no_op":
+        apply_payment_outcome(booking, pending_payment, PaymentStatus.SUCCESS)
+    else:
+        transition(booking, BookingStatus.CANCELLED)
+    stored = WebhookEvent(
+        event_id="evt-terminal",
+        provider_ref=pending_payment.provider_ref,
+        status="FAILED",
+        payload=event(pending_payment, event_id="evt-terminal"),
+        last_error="Temporary failure",
+    )
+    db.add(stored)
+    db.commit()
+    assert retry_failed_webhook_events(db) == 1
+    assert stored.status == "PROCESSED"
+    assert stored.last_error is None
+    assert booking.status == (
+        BookingStatus.CONFIRMED if terminal == "no_op" else BookingStatus.CANCELLED
+    )
+
+
+@pytest.mark.parametrize("failure", ["database", "locked_booking", "locked_payment"])
+def test_webhook_retry_failure_does_not_block_other_events(
+    db: Session,
+    pending_payment: Payment,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from app import worker
+    from app.services import payments
+
+    booking = db.get(Booking, pending_payment.booking_id)
+    second_booking = Booking(
+        user_id=booking.user_id,
+        centre_id=booking.centre_id,
+        test_id=booking.test_id,
+        appointment_at=booking.appointment_at + timedelta(days=1),
+        amount=booking.amount,
+    )
+    db.add(second_booking)
+    db.flush()
+    second_payment = Payment(
+        booking_id=second_booking.id,
+        amount=second_booking.amount,
+        provider_ref="sim_second",
+        status=PaymentStatus.PENDING,
+    )
+    db.add(second_payment)
+    db.flush()
+    for payment, event_id in (
+        (pending_payment, "evt-first"),
+        (second_payment, "evt-second"),
+    ):
+        db.add(
+            WebhookEvent(
+                event_id=event_id,
+                provider_ref=payment.provider_ref,
+                status="FAILED",
+                payload=event(payment, event_id=event_id),
+            )
+        )
+    db.commit()
+    apply_outcome = payments.apply_payment_outcome
+    available_events = []
+
+    def fail_first(
+        booking: Booking, payment: Payment, outcome: PaymentStatus | str
+    ) -> None:
+        apply_outcome(booking, payment, outcome)
+        if payment.id == pending_payment.id and failure == "database":
+            session = object_session(payment)
+            session.flush()
+            session.execute(text("SELECT 1 / 0"))
+        if payment.id == second_payment.id:
+            with Session(db.bind) as observer:
+                available = observer.scalars(
+                    select(WebhookEvent).with_for_update(skip_locked=True)
+                ).all()
+                available_events.append(
+                    [(row.event_id, row.status, row.attempts) for row in available]
+                )
+
+    monkeypatch.setattr(payments, "apply_payment_outcome", fail_first)
+    with Session(db.bind) as other, Session(db.bind) as retry_db:
+        monkeypatch.setattr(worker, "SessionLocal", lambda: retry_db)
+        if failure == "locked_booking":
+            other.scalar(
+                select(Booking).where(Booking.id == booking.id).with_for_update()
+            )
+        elif failure == "locked_payment":
+            other.scalar(
+                select(Payment)
+                .where(Payment.id == pending_payment.id)
+                .with_for_update()
+            )
+        retry_db.execute(text("SET LOCAL lock_timeout = '250ms'"))
+        started = monotonic()
+        assert worker.retry_failed_webhooks.run() == 1
+        if failure.startswith("locked_"):
+            assert monotonic() - started < 0.2
+    assert available_events == [
+        [("evt-first", "FAILED", 2 if failure == "database" else 1)]
+    ]
+    db.refresh(pending_payment)
+    db.refresh(second_payment)
+    assert pending_payment.status == PaymentStatus.PENDING
+    assert second_payment.status == PaymentStatus.SUCCESS
+    stored = db.scalars(select(WebhookEvent).order_by(WebhookEvent.id)).all()
+    assert [(row.status, row.attempts) for row in stored] == [
+        ("FAILED", 2 if failure == "database" else 1),
+        ("PROCESSED", 2),
+    ]
+    if failure.startswith("locked_"):
+        assert stored[0].last_error is None
+        assert payments.retry_failed_webhook_events(db) == 1
+        db.refresh(pending_payment)
+        assert pending_payment.status == PaymentStatus.SUCCESS
+
+
+@pytest.mark.parametrize("single", [True, False])
+@pytest.mark.parametrize("result", ["empty", "processed", "failed", "busy"])
+def test_webhook_retry_preserves_caller_transaction(
+    db: Session,
+    pending_payment: Payment,
+    monkeypatch: pytest.MonkeyPatch,
+    result: str,
+    single: bool,
+) -> None:
+    from app.services import payments
+
+    booking = db.get(Booking, pending_payment.booking_id)
+    user = db.get(User, booking.user_id)
+    original_name = user.full_name
+    if result != "empty":
+        db.add(
+            WebhookEvent(
+                event_id="evt-caller",
+                provider_ref=pending_payment.provider_ref,
+                status="FAILED",
+                payload=event(pending_payment, event_id="evt-caller"),
+            )
+        )
+    db.commit()
+
+    def fail_outcome(*args: object) -> None:
+        object_session(pending_payment).execute(text("SELECT 1 / 0"))
+
+    if result == "failed":
+        monkeypatch.setattr(payments, "apply_payment_outcome", fail_outcome)
+    with Session(db.bind) as other:
+        if result == "busy":
+            other.scalar(
+                select(Booking).where(Booking.id == booking.id).with_for_update()
+            )
+        user.full_name = "Pending caller change"
+        if single:
+            assert payments.retry_failed_webhook_event(db) == (
+                0 if result == "empty" else 1,
+                result,
+            )
+        else:
+            assert payments.retry_failed_webhook_events(db) == (result == "processed")
+        assert user.full_name == "Pending caller change"
+        assert other.get(User, user.id).full_name == original_name
+        db.rollback()
+        assert user.full_name == original_name
+        other.expire_all()
+        assert other.get(User, user.id).full_name == original_name
 
 
 def test_concurrent_webhooks_process_event_only_once(

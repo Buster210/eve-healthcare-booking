@@ -24,12 +24,28 @@ def test_booking_pending_to_terminal(new_status):
 
 @pytest.mark.parametrize(
     "current",
-    [BookingStatus.CONFIRMED, BookingStatus.FAILED, BookingStatus.CANCELLED],
+    [BookingStatus.CONFIRMED, BookingStatus.CANCELLED],
 )
 @pytest.mark.parametrize("new_status", list(BookingStatus))
 def test_booking_terminal_has_no_outgoing(current, new_status):
     with pytest.raises(InvalidTransition):
         transition(entity(current), new_status)
+
+
+@pytest.mark.parametrize("current", [BookingStatus.FAILED, "FAILED"])
+def test_failed_booking_can_return_to_pending(current):
+    b = entity(current)
+    transition(b, BookingStatus.PENDING)
+    assert b.status == BookingStatus.PENDING
+
+
+@pytest.mark.parametrize(
+    "new_status",
+    [BookingStatus.CONFIRMED, BookingStatus.FAILED, BookingStatus.CANCELLED],
+)
+def test_failed_booking_requires_pending_before_another_outcome(new_status):
+    with pytest.raises(InvalidTransition):
+        transition(entity(BookingStatus.FAILED), new_status)
 
 
 def test_booking_rejects_payment_only_status():
