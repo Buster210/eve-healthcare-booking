@@ -395,17 +395,98 @@ def test_expire_stale_bookings(
             )
         )
     db.commit()
-    count = bookings.expire_stale_bookings(db, timedelta(minutes=30))
+    count, _ = bookings.expire_stale_bookings(db, timedelta(minutes=30))
     assert count == int(expected == BookingStatus.CANCELLED and status != expected)
     db.commit()
     db.refresh(booking)
     assert booking.status == expected
-    assert bookings.expire_stale_bookings(db, timedelta(minutes=30)) == 0
+    assert bookings.expire_stale_bookings(db, timedelta(minutes=30))[0] == 0
     db.commit()
     if expected == BookingStatus.CANCELLED:
         assert (
             client.post("/bookings", json=payload, headers=headers).status_code == 201
         )
+
+
+@pytest.mark.parametrize("booking_count", [4, 5])
+def test_expiry_returns_one_keyset_batch_without_committing(
+    db: Session,
+    make_user: Callable[..., User],
+    make_offering: Callable[..., CentreTest],
+    monkeypatch: pytest.MonkeyPatch,
+    booking_count: int,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from app.services.bookings import expire_stale_bookings
+
+    user = make_user()
+    offering = make_offering()
+    now = datetime.now(UTC)
+    items = [
+        Booking(
+            user_id=user.id,
+            centre_id=offering.centre_id,
+            test_id=offering.test_id,
+            appointment_at=now + timedelta(days=index + 1),
+            amount=offering.price,
+            created_at=now - timedelta(hours=1),
+        )
+        for index in range(booking_count)
+    ]
+    db.add_all(items)
+    db.flush()
+    for booking, status in zip(
+        items[:3],
+        [PaymentStatus.PENDING, PaymentStatus.SUCCESS, PaymentStatus.FAILED],
+        strict=True,
+    ):
+        db.add(
+            Payment(
+                booking_id=booking.id,
+                amount=booking.amount,
+                provider_ref=f"sim_{uuid4().hex}",
+                status=status,
+            )
+        )
+    db.commit()
+    commit = MagicMock(wraps=db.commit)
+    monkeypatch.setattr(db, "commit", commit)
+    pending = BookingStatus.PENDING
+    cancelled = BookingStatus.CANCELLED
+    assert expire_stale_bookings(db, timedelta(minutes=30), batch_size=2) == (
+        0,
+        items[1].id,
+    )
+    assert [booking.status for booking in items] == [pending] * booking_count
+    assert expire_stale_bookings(
+        db, timedelta(minutes=30), after_id=items[1].id, batch_size=2
+    ) == (2, items[3].id)
+    assert [booking.status for booking in items] == [
+        pending,
+        pending,
+        cancelled,
+        cancelled,
+    ] + [pending] * (booking_count - 4)
+    assert expire_stale_bookings(
+        db, timedelta(minutes=30), after_id=items[3].id, batch_size=2
+    ) == ((1, items[4].id) if booking_count == 5 else (0, None))
+    assert expire_stale_bookings(
+        db, timedelta(minutes=30), after_id=items[-1].id, batch_size=2
+    ) == (0, None)
+    commit.assert_not_called()
+    db.rollback()
+    for booking in items:
+        db.refresh(booking)
+        assert booking.status == pending
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_expiry_rejects_nonpositive_batch_size(db: Session, batch_size: int) -> None:
+    from app.services.bookings import expire_stale_bookings
+
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        expire_stale_bookings(db, timedelta(minutes=30), batch_size=batch_size)
 
 
 def test_expiry_skips_locked_bookings(
@@ -423,9 +504,9 @@ def test_expiry_skips_locked_bookings(
     db.commit()
     with Session(db.get_bind()) as other:
         other.get(Booking, booking.id, with_for_update=True)
-        assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+        assert expire_stale_bookings(db, timedelta(minutes=30)) == (0, None)
         db.commit()
-    assert expire_stale_bookings(db, timedelta(minutes=30)) == 1
+    assert expire_stale_bookings(db, timedelta(minutes=30)) == (1, booking.id)
     db.rollback()
     db.refresh(booking)
     assert booking.status == BookingStatus.PENDING
@@ -442,7 +523,7 @@ def test_expiry_rejects_nonpositive_age(db: Session, minutes: int) -> None:
 def test_expiry_with_no_bookings(db: Session) -> None:
     from app.services.bookings import expire_stale_bookings
 
-    assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+    assert expire_stale_bookings(db, timedelta(minutes=30)) == (0, None)
 
 
 def test_expiry_skips_booking_with_locked_payment(
@@ -469,9 +550,9 @@ def test_expiry_skips_booking_with_locked_payment(
     db.commit()
     with SASession(db.get_bind()) as other:
         other.get(Payment, payment.id, with_for_update=True)
-        assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+        assert expire_stale_bookings(db, timedelta(minutes=30)) == (0, booking.id)
         db.commit()
     db.refresh(booking)
     assert booking.status == BookingStatus.PENDING
-    assert expire_stale_bookings(db, timedelta(minutes=30)) == 0
+    assert expire_stale_bookings(db, timedelta(minutes=30)) == (0, booking.id)
     db.rollback()

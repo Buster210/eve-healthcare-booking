@@ -51,9 +51,21 @@ celery_setup_logging.connect(_setup_celery_logging)
 
 @app.task(autoretry_for=(OperationalError,), retry_backoff=True, max_retries=5)
 def expire_stale_bookings() -> int:
+    count = 0
+    last_id = 0
     with SessionLocal() as db:
-        count = bookings.expire_stale_bookings(db, timedelta(minutes=30))
-        db.commit()
+        try:
+            while True:
+                cancelled, last_id = bookings.expire_stale_bookings(
+                    db, timedelta(minutes=30), after_id=last_id
+                )
+                if last_id is None:
+                    break
+                db.commit()
+                count += cancelled
+        except Exception:
+            db.rollback()
+            raise
     logger.info("Expired %s stale bookings", count)
     return count
 

@@ -14,16 +14,23 @@ from app.state import InvalidTransition, transition
 logger = logging.getLogger(__name__)
 
 
-def expire_stale_bookings(db: Session, older_than: timedelta) -> int:
+def expire_stale_bookings(
+    db: Session, older_than: timedelta, *, after_id: int = 0, batch_size: int = 500
+) -> tuple[int, int | None]:
     if older_than <= timedelta(0):
         raise ValueError("older_than must be positive")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    cutoff = datetime.now(UTC) - older_than
     bookings = db.scalars(
         select(Booking)
         .where(
             Booking.status == BookingStatus.PENDING,
-            Booking.created_at < datetime.now(UTC) - older_than,
+            Booking.created_at < cutoff,
+            Booking.id > after_id,
         )
         .order_by(Booking.id)
+        .limit(batch_size)
         .with_for_update(skip_locked=True)
     ).all()
     count = 0
@@ -48,7 +55,7 @@ def expire_stale_bookings(db: Session, older_than: timedelta) -> int:
             transition(booking, BookingStatus.CANCELLED)
             count += 1
     db.flush()
-    return count
+    return count, bookings[-1].id if bookings else None
 
 
 def create_booking(db: Session, user_id: int, payload: BookingCreate) -> Booking:
