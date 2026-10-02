@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.enums import BookingStatus, PaymentStatus
-from app.errors import Conflict, InvalidState, NotFound
+from app.errors import Conflict, InvalidState, NotFound, Unauthorized
 from app.models import Booking, CentreTest, Payment
 from app.schemas.bookings import BookingCreate
 from app.state import InvalidTransition, transition
@@ -72,8 +72,13 @@ def create_booking(db: Session, user_id: int, payload: BookingCreate) -> Booking
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        if exc.orig.diag.constraint_name == "uq_bookings_active_slot":
+        constraint_name = exc.orig.diag.constraint_name
+        if constraint_name == "uq_bookings_active_slot":
             raise Conflict("An active booking already exists for this slot") from exc
+        if constraint_name == "fk_bookings_centre_test":
+            raise NotFound("Test is not offered at this centre") from exc
+        if constraint_name == "fk_bookings_user_id_users":
+            raise Unauthorized() from exc
         raise
     db.refresh(booking)
     logger.info("booking_created", extra={"booking_id": booking.id, "user_id": user_id})

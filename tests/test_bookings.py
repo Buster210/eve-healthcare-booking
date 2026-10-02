@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.enums import BookingStatus, PaymentStatus
@@ -81,6 +82,65 @@ def test_test_must_be_offered_at_selected_centre(
     payload["test_id"] = make_offering().test_id
     response = client.post("/bookings", json=payload, headers=auth_headers(make_user()))
     assert response.status_code == 404
+
+
+def test_offering_deleted_after_lookup_returns_not_found(
+    client: TestClient,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    make_offering: Callable[..., CentreTest],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    offering = make_offering()
+    original_scalar = Session.scalar
+
+    def delete_after_offering_lookup(session: Session, *args: object, **kwargs: object):
+        result = original_scalar(session, *args, **kwargs)
+        if isinstance(result, CentreTest):
+            with Session(session.get_bind()) as deleting:
+                deleting.execute(delete(CentreTest).where(CentreTest.id == result.id))
+                deleting.commit()
+        return result
+
+    monkeypatch.setattr(Session, "scalar", delete_after_offering_lookup)
+    response = client.post(
+        "/bookings",
+        json=booking_payload(offering),
+        headers=auth_headers(make_user()),
+    )
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {
+            "code": "NOT_FOUND",
+            "message": "Test is not offered at this centre",
+        }
+    }
+
+
+def test_user_deleted_after_lookup_returns_unauthorized(
+    client: TestClient,
+    make_user: Callable[..., User],
+    auth_headers: Callable[[User], dict[str, str]],
+    make_offering: Callable[..., CentreTest],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    offering = make_offering()
+    user = make_user()
+    headers = auth_headers(user)
+    original_scalar = Session.scalar
+
+    def delete_after_offering_lookup(session: Session, *args: object, **kwargs: object):
+        result = original_scalar(session, *args, **kwargs)
+        if isinstance(result, CentreTest):
+            with Session(session.get_bind()) as deleting:
+                deleting.execute(delete(User).where(User.id == user.id))
+                deleting.commit()
+        return result
+
+    monkeypatch.setattr(Session, "scalar", delete_after_offering_lookup)
+    response = client.post("/bookings", json=booking_payload(offering), headers=headers)
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "UNAUTHORIZED"
 
 
 def test_duplicate_active_slot_is_conflict(
