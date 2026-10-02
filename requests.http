@@ -1,0 +1,147 @@
+@baseUrl = http://localhost:8000
+@token = {{login.response.body.access_token}}
+@centreId = {{centres.response.body.items[0].id}}
+@testId = {{centre.response.body.tests[0].id}}
+@bookingId = {{booking.response.body.id}}
+@providerRef = {{payment.response.body.provider_ref}}
+
+### Sign up
+# @name signup
+POST {{baseUrl}}/auth/signup
+Content-Type: application/json
+
+{
+  "email": "reviewer@example.com",
+  "password": "password123",
+  "full_name": "API Reviewer"
+}
+
+### Duplicate sign up: 409
+POST {{baseUrl}}/auth/signup
+Content-Type: application/json
+
+{
+  "email": "reviewer@example.com",
+  "password": "password123",
+  "full_name": "API Reviewer"
+}
+
+### Invalid login: 401
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "reviewer@example.com",
+  "password": "wrong-password"
+}
+
+### Log in
+# @name login
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+  "email": "reviewer@example.com",
+  "password": "password123"
+}
+
+### Current user
+GET {{baseUrl}}/auth/me
+Authorization: Bearer {{token}}
+
+### List centres
+# @name centres
+GET {{baseUrl}}/centres?limit=20&offset=0
+
+### Centre detail
+# @name centre
+GET {{baseUrl}}/centres/{{centreId}}
+
+### Missing centre: 404
+GET {{baseUrl}}/centres/2147483647
+
+### Missing token: 401
+POST {{baseUrl}}/bookings
+Content-Type: application/json
+
+{
+  "centre_id": {{centreId}},
+  "test_id": {{testId}},
+  "appointment_at": "2030-01-01T10:00:00+05:30"
+}
+
+### Invalid appointment: 422
+POST {{baseUrl}}/bookings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "centre_id": {{centreId}},
+  "test_id": {{testId}},
+  "appointment_at": "2000-01-01T10:00:00+05:30"
+}
+
+### Create booking: 201, PENDING
+# @name booking
+POST {{baseUrl}}/bookings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "centre_id": {{centreId}},
+  "test_id": {{testId}},
+  "appointment_at": "2030-01-01T10:00:00+05:30"
+}
+
+### Payment without token: 401
+POST {{baseUrl}}/payments/
+Content-Type: application/json
+
+{
+  "booking_id": {{bookingId}},
+  "simulate_outcome": "PENDING"
+}
+
+### Invalid booking: 404
+POST {{baseUrl}}/payments/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "booking_id": 2147483647,
+  "simulate_outcome": "PENDING"
+}
+
+### Create pending payment: 201, PENDING + provider_ref
+# @name payment
+POST {{baseUrl}}/payments/
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "booking_id": {{bookingId}},
+  "simulate_outcome": "PENDING"
+}
+
+### Invalid webhook signature: 401
+POST {{baseUrl}}/payments/webhook/
+Content-Type: application/json
+X-Signature: invalid
+
+{
+  "event_id": "evt-invalid-signature",
+  "provider_ref": "{{providerRef}}",
+  "status": "SUCCESS"
+}
+
+### Resolve payment by signed webhook (run in a terminal)
+# Copy provider_ref from the pending payment response into PROVIDER_REF below.
+# Use the same WEBHOOK_SECRET in .env as the API (exported values take precedence).
+# PROVIDER_REF=<provider_ref from payment response>
+# uv run --env-file .env python -m scripts.send_webhook "$PROVIDER_REF" SUCCESS --base-url http://localhost:8000 --event-id evt-ide-demo
+# Expected: {"result":"processed"}. Repeat that command for {"result":"duplicate"}.
+# Use a fresh --event-id for each new payment; --base-url must match baseUrl.
+
+### Booking after webhook: CONFIRMED
+GET {{baseUrl}}/bookings/{{bookingId}}
+Authorization: Bearer {{token}}
